@@ -1,7 +1,11 @@
+import java.io.{File, FileWriter, Reader}
+import java.nio.charset.StandardCharsets
+import java.nio.file.{Files, Path, Paths}
 import java.sql.Timestamp
 import java.util.Properties
 
-import au.com.bytecode.opencsv.CSVReader
+import scala.collection.JavaConversions._
+import au.com.bytecode.opencsv.{CSVParser, CSVReader}
 import breeze.io.CSVReader
 
 import scala.collection.JavaConverters._
@@ -15,27 +19,26 @@ import org.apache.spark.mllib.linalg.distributed.RowMatrix
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.types._
 
+import scala.collection.mutable
 import scala.io.Source
 
 object NewYorkTimesComments {
 
   val customSchema = StructType(Array(
-    //StructField("abstract", StringType, true),
-    StructField("articleID", StringType, true),
-    StructField("articleWordCount", IntegerType, true),
-    StructField("byline", StringType, true),
-    StructField("documentType", StringType, true),
-    StructField("headline", StringType, true),
-    StructField("keywords", StringType, true),
-    StructField("multimedia", IntegerType, true),
-    StructField("newDesk", StringType, true),
-    StructField("printPage", IntegerType, true),
-    StructField("pubDate", TimestampType, true),
-    StructField("sectionName", StringType, true),
-    StructField("snippet", StringType, true),
-    StructField("source", StringType, true),
-    StructField("typeOfMaterial", StringType, true),
-    StructField("webURL", StringType, true)
+    StructField("articleID", StringType, nullable = true),
+    StructField("articleWordCount", IntegerType, nullable = true),
+    StructField("byline", StringType, nullable = true),
+    StructField("documentType", StringType, nullable = true),
+    StructField("headline", StringType, nullable = true),
+    StructField("keywords", StringType, nullable = true),
+    StructField("newDesk", StringType, nullable = true),
+    StructField("printPage", IntegerType, nullable = true),
+    StructField("pubDate", TimestampType, nullable = true),
+    StructField("sectionName", StringType, nullable = true),
+    StructField("snippet", StringType, nullable = true),
+    StructField("source", StringType, nullable = true),
+    StructField("typeOfMaterial", StringType, nullable = true),
+    StructField("webURL", StringType, nullable = true)
   ))
 
   val article2017: Seq[String] = Seq("ArticlesJan2017.csv", "ArticlesFeb2017.csv", "ArticlesMarch2017.csv", "ArticlesApril2017.csv", "ArticlesMay2017.csv")
@@ -53,13 +56,15 @@ object NewYorkTimesComments {
   import sparkSession.implicits._
 
   def main(args: Array[String]): Unit = {
+
     val articles: DataFrame = loadArticlesAsDF()
     articles.printSchema()
     println(articles.count())
     println(articles.show(50))
+    //articles.groupBy("snippet").count().orderBy(desc("count")).show()
+    basicStats(articles)
 
-
-    lsa(articles, "headline", "snippet")
+    //lsa(articles, "headline", "snippet")
 
   }
 
@@ -82,6 +87,18 @@ object NewYorkTimesComments {
   }
 
   def basicStats(articles: DataFrame): Unit = {
+
+    articles.describe("articleWordCount", "printPage").show()
+
+    printHist("count_word_hist.txt", articles.select("articleWordCount").map(v => v.getInt(0)).rdd.histogram(20))
+    printHist("print_page_hist.txt", articles.select("printPage").map(v => v.getInt(0)).rdd.histogram(50))
+
+    articles.groupBy("documentType").count().orderBy(desc("count")).show(100)
+    articles.groupBy("newDesk").count().orderBy(desc("count")).show(100)
+    articles.groupBy("sectionName").count().orderBy(desc("count")).show(100)
+    articles.groupBy("source").count().orderBy(desc("count")).show(100)
+    articles.groupBy("typeOfMaterial").count().orderBy(desc("count")).show(100)
+
     val authorsCount = articles.flatMap(row => parseAuthor(row.getAs("byline")))
       .groupBy("value")
       .count()
@@ -108,32 +125,40 @@ object NewYorkTimesComments {
     text.replaceAll("^By ", "").split(",|( and )").map(_.trim)
   }
 
-  def tfidf(df: DataFrame): DataFrame = {
-    val tokens = df.map(row => preprocessText(row.getAs("snippet")))
+  def parseCsvRow(headers: Seq[String], row: String): Row = {
+    val parser: CSVParser = new CSVParser(',', '"')
+    val article = parser.parseLine(row)
+    val articleFields: mutable.TreeMap[String, Any] = mutable.TreeMap()
+    article.zip(headers).foreach(articleField => articleFields(articleField._2) = convert(articleField._2, articleField._1))
+    articleFields.remove("abstract")
+    articleFields.remove("multimedia")
+    if (articleFields.size != 14) {
+      throw new Exception("an article should have 14 fields")
+    }
+    Row.fromSeq(articleFields.values.toSeq)
+  }
 
-    // compute TF
-    val cvModel: CountVectorizerModel = new CountVectorizer().setInputCol("value").setOutputCol("tf").fit(tokens)
-    val headlineTF = cvModel.transform(tokens)
-
-    // compute IDF
-    val idf = new IDF().setInputCol("tf").setOutputCol("idf")
-    val idfModel = idf.fit(headlineTF)
-    idfModel.transform(headlineTF)
+  def convert(fieldName: String, fieldValue: String): Any = {
+    fieldName match {
+      case "articleWordCount" => Integer.parseInt(fieldValue)
+      case "multimedia" => Integer.parseInt(fieldValue)
+      case "printPage" => Integer.parseInt(fieldValue)
+      case "pubDate" => Timestamp.valueOf(fieldValue)
+      case _ => fieldValue
+    }
   }
 
   def loadArticlesAsDF(): DataFrame = {
-    val csv: CSVReader = new CSVReader(null, ',', "\"")
-
-    //val schema = Encoders.product[Article].schema
-    sparkSession.read
-      .option("header", "true")
-      .option("charset", "UTF8")
-      .option("delimiter", ",")
-      //.schema(customSchema)
-      .option("inferSchema", value = true)
-      //.csv("data/test.csv")
-      .csv("data/ArticlesApril2017.csv")
-      //.csv(articleAll.map(f => "data/" + f): _*)
+    var allRDD = sparkSession.sparkContext.emptyRDD[Row]
+    for (path <- articleAll.map(p => "data/" + p)) {
+      val csvFile: RDD[String] = sparkSession.sparkContext.textFile(path)
+      val headers = csvFile.first().split(",").map(h => h.trim)
+      val articleRDD = csvFile.mapPartitionsWithIndex({
+        (idx, iter) => if (idx == 0) iter.drop(1) else iter
+      }).map(row => parseCsvRow(headers, row))
+      allRDD = allRDD.union(articleRDD)
+    }
+    sparkSession.createDataFrame(allRDD, customSchema)
   }
 
   def preprocessText(text: String): Seq[String] = {
@@ -146,5 +171,12 @@ object NewYorkTimesComments {
       .filter(token => token.length > 2)
       .filter(token => !stopwords.contains(token))
       .map(token => token.toLowerCase)
+  }
+
+  def printHist(filename: String, hist: (Array[Double], Array[Long])) = {
+    val writer = new FileWriter(filename)
+    hist._1.zip(hist._2).foreach(col => writer.append(col._1.toString).append(' ').append(col._2.toString).append('\n'))
+    writer.close()
+
   }
 }
