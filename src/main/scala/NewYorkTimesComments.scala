@@ -1,21 +1,18 @@
-import java.io.{File, FileWriter, Reader}
-import java.nio.charset.StandardCharsets
-import java.nio.file.{Files, Path, Paths}
+import java.io.FileWriter
 import java.sql.Timestamp
 import java.util.Properties
 
-import scala.collection.JavaConversions._
-import au.com.bytecode.opencsv.{CSVParser, CSVReader}
-import breeze.io.CSVReader
+import au.com.bytecode.opencsv.CSVParser
+import breeze.linalg.DenseVector
 
 import scala.collection.JavaConverters._
 import edu.stanford.nlp.pipeline.{CoreDocument, StanfordCoreNLP}
 import org.apache.log4j.{Level, LogManager}
-import org.apache.spark.ml.feature.{HashingTF, IDF}
 import org.apache.spark.sql._
 import org.apache.spark.sql.functions._
-import org.apache.spark.ml.feature.{CountVectorizer, CountVectorizerModel}
+import org.apache.spark.ml.linalg
 import org.apache.spark.mllib.linalg.distributed.RowMatrix
+import org.apache.spark.mllib.linalg.{Vector, Vectors}
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.types._
 
@@ -23,6 +20,11 @@ import scala.collection.mutable
 import scala.io.Source
 
 object NewYorkTimesComments {
+
+  case class QualitativeVar (
+    name: String,
+    modalities: Seq[String]
+  )
 
   val customSchema = StructType(Array(
     StructField("articleID", StringType, nullable = true),
@@ -62,10 +64,39 @@ object NewYorkTimesComments {
     println(articles.count())
     println(articles.show(50))
     //articles.groupBy("snippet").count().orderBy(desc("count")).show()
-    basicStats(articles)
 
+    val tdc = disjunctiveForm(articles, Seq("documentType", "newDesk", "source", "typeOfMaterial"))
+    //tdc._1.take(10).foreach(println(_))
+    val sumVector = tdc._1.reduce((v1, v2) => addVectors(v1, v2))
+    println(sumVector.toDense)
+    //val modalities = articles.select("sectionName").distinct().orderBy(asc("sectionName")).map(row => row.getString(0)).collect()
+    //disjunctiveForm(articles, "sectionName", modalities).show(10)
+    basicStats(articles)
     //lsa(articles, "headline", "snippet")
 
+  }
+
+  def addVectors(v1: Vector, v2: Vector): Vector = {
+    Vectors.dense((new DenseVector(v1.toDense.values) + new DenseVector(v2.toDense.values)).data).toSparse
+  }
+
+  def rowToVector(row: Row, vars: Seq[QualitativeVar]): Vector = {
+    val v: Seq[Double] = for (variable <- vars; modality <- variable.modalities) yield {
+      if (row.getAs(variable.name).equals(modality)) {
+        1.0
+      } else {
+        0.0
+      }
+    }
+    Vectors.dense(v.toArray).toSparse
+  }
+
+  def disjunctiveForm(df: DataFrame, colNames: Seq[String]): (RDD[Vector], Seq[QualitativeVar]) = {
+    val vars = for (colName <- colNames) yield {
+      val modalities = df.select(colName).distinct().orderBy(asc(colName)).map(row => row.getString(0)).collect()
+      QualitativeVar(colName, modalities)
+    }
+    (df.rdd.map(row => rowToVector(row, vars)), vars)
   }
 
   def lsa(df: DataFrame, titleCol: String, textCol: String) = {
@@ -74,7 +105,7 @@ object NewYorkTimesComments {
     val (termDocMatrix, termIds, docIds, idfs) =
       LSAUtils.termDocumentMatrix(tokens, numTerms, sparkSession.sparkContext)
     val mat = new RowMatrix(termDocMatrix)
-    val k = 200
+    val k = 20
     val svd = mat.computeSVD(k, computeU = true)
 
     val topConceptTerms = RunLSA.topTermsInTopConcepts(svd, 10, 10, termIds)
