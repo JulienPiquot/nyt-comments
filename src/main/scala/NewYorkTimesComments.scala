@@ -11,7 +11,7 @@ import org.apache.log4j.{Level, LogManager}
 import org.apache.spark.sql._
 import org.apache.spark.sql.functions._
 import org.apache.spark.ml.linalg
-import org.apache.spark.mllib.linalg.distributed.RowMatrix
+import org.apache.spark.mllib.linalg.distributed._
 import org.apache.spark.mllib.linalg.{Vector, Vectors}
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.types._
@@ -21,10 +21,11 @@ import scala.io.Source
 
 object NewYorkTimesComments {
 
-  case class QualitativeVar (
-    name: String,
-    modalities: Seq[String]
-  )
+  case class QualitativeVar (name: String, modalities: Seq[String]) {
+    def getModalities: Seq[String] = {
+      for (modality <- modalities) yield name.toUpperCase + "." + modality
+    }
+  }
 
   val customSchema = StructType(Array(
     StructField("articleID", StringType, nullable = true),
@@ -52,6 +53,8 @@ object NewYorkTimesComments {
   val sparkSession: SparkSession = SparkSession.builder.
     master("local")
     .appName("NYT Comments")
+    .config("spark.driver.memory", "16g")
+    .config("spark.driver.cores", "2")
     .getOrCreate()
   LogManager.getRootLogger.setLevel(Level.WARN)
 
@@ -60,20 +63,55 @@ object NewYorkTimesComments {
   def main(args: Array[String]): Unit = {
 
     val articles: DataFrame = loadArticlesAsDF()
+    val nbArticles = articles.count()
     articles.printSchema()
     println(articles.count())
     println(articles.show(50))
     //articles.groupBy("snippet").count().orderBy(desc("count")).show()
 
-    val tdc = disjunctiveForm(articles, Seq("documentType", "newDesk", "source", "typeOfMaterial"))
-    //tdc._1.take(10).foreach(println(_))
-    val sumVector = tdc._1.reduce((v1, v2) => addVectors(v1, v2))
-    println(sumVector.toDense)
-    //val modalities = articles.select("sectionName").distinct().orderBy(asc("sectionName")).map(row => row.getString(0)).collect()
-    //disjunctiveForm(articles, "sectionName", modalities).show(10)
-    basicStats(articles)
-    //lsa(articles, "headline", "snippet")
+    val colNames = Seq("documentType", "newDesk", "source", "typeOfMaterial")
+    val tdc = disjunctiveForm(articles, colNames)
+    println(tdc._2.map(m => m.getModalities.mkString(",")).mkString(","))
+    //val tdcNorm: RDD[Vector] = normalizeTdc(tdc._1, nbArticles)
 
+    val matIndividus: BlockMatrix = toBlockMatrix(new RowMatrix(tdc._1))
+    println(matIndividus.toLocalMatrix())
+    val matVariables: BlockMatrix = matIndividus.transpose
+    println(matVariables.toLocalMatrix())
+
+    //val burtTable = toBlockMatrix(matVariables).multiply(toBlockMatrix(matIndividus)).toLocalMatrix()
+    //println(burtTable)
+    //writeRdd(burtTable.rows, tdc._2, "burttable.txt")
+
+
+//    val pcaResults = matVariables.computePrincipalComponentsAndExplainedVariance(2)
+//    writeRdd(matVariables.multiply(pcaResults._1).rows, "variables.csv")
+//
+
+  }
+
+  def toBlockMatrix(rm: RowMatrix): BlockMatrix = {
+    new IndexedRowMatrix(rm.rows.zipWithIndex().map({case (row, idx) => IndexedRow(idx, row)})).toBlockMatrix()
+  }
+
+  def printBurtTable(vectors: RDD[Vector], mod: Seq[QualitativeVar], filename: String): Unit = {
+    println(mod.map(m => m.getModalities.mkString(",")).mkString(","))
+    vectors.map(row => row.toArray.mkString(",")).saveAsTextFile(filename)
+  }
+
+  def normalizeTdc(tdc: RDD[Vector], size: Long): RDD[Vector] = {
+    val sumVector = tdc.reduce((v1, v2) => addVectors(v1, v2))
+    val tdcNorm = tdc.map(v => norm(v, sumVector, size))
+//    tdcNorm.take(10).foreach(println(_))
+//    val checkTdc = tdcNorm.reduce((v1, v2) => addVectors(v1, v2))
+//    println(checkTdc.toDense)
+    tdcNorm
+  }
+
+  def norm(v1: Vector, sumV: Vector, numArticles: Long): Vector = {
+    val p = new DenseVector(sumV.toDense.values) / numArticles.toDouble
+    val x = (new DenseVector(v1.toDense.values) /:/ p) - 1.0
+    Vectors.dense(x.data)
   }
 
   def addVectors(v1: Vector, v2: Vector): Vector = {
