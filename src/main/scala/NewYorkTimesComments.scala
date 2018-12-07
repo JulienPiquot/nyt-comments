@@ -11,6 +11,7 @@ import org.apache.log4j.{Level, LogManager}
 import org.apache.spark.sql._
 import org.apache.spark.sql.functions._
 import org.apache.spark.ml.linalg
+import org.apache.spark.mllib.feature.Word2VecModel
 import org.apache.spark.mllib.linalg.distributed._
 import org.apache.spark.mllib.linalg.{Matrix, Vector, Vectors}
 import org.apache.spark.rdd.RDD
@@ -53,8 +54,7 @@ object NewYorkTimesComments {
   val sparkSession: SparkSession = SparkSession.builder.
     master("local")
     .appName("NYT Comments")
-    .config("spark.driver.memory", "16g")
-    .config("spark.driver.cores", "2")
+    //.config("spark.driver.cores", "2")
     .getOrCreate()
   LogManager.getRootLogger.setLevel(Level.WARN)
 
@@ -64,17 +64,22 @@ object NewYorkTimesComments {
 
     val articles: DataFrame = loadArticlesAsDF()
     val nbArticles = articles.count()
-    articles.printSchema()
-    println(articles.count())
-    println(articles.show(50))
+    //basicStats(articles)
+    //analyseArticleTyplogy(articles)
+    val googleModel = GoogleNewsEmbeddingUtils.loadBin( "data/GoogleNews-vectors-negative300.bin")
+    println(googleModel.findSynonyms("Paris", 10))
+    googleModel.save(sparkSession.sparkContext, "GoogleNewsW2VModel")
 
+
+  }
+
+  def analyseArticleTyplogy(articles: DataFrame): Unit = {
     val colNames = Seq("documentType", "newDesk", "source", "typeOfMaterial")
     val tdc = disjunctiveForm(articles, colNames)
     val matIndividus: BlockMatrix = toBlockMatrix(new RowMatrix(tdc._1))
     val matVariables: BlockMatrix = matIndividus.transpose
     val burtTable = matVariables.multiply(matIndividus)
-    printBurtTable(burtTable.toLocalMatrix(), tdc._2, "data/burt_table.txt")
-
+    printBurtTable(burtTable.toLocalMatrix(), tdc._2, "data_results/burt_table.txt")
   }
 
   def toBlockMatrix(rm: RowMatrix): BlockMatrix = {
@@ -82,18 +87,18 @@ object NewYorkTimesComments {
   }
 
   def printBurtTable(bt: Matrix, mod: Seq[QualitativeVar], filename: String): Unit = {
-    println(mod.map(m => m.getModalities.mkString(",")).mkString(","))
     val w = new FileWriter(filename)
-    w.append(bt.toString(Int.MaxValue, Int.MaxValue))
+    val modalities = mod.flatMap(m => m.getModalities)
+    w.append(modalities.mkString(",")).append('\n')
+    bt.rowIter.zip(modalities.iterator).foreach({
+      case (vector, modality) => w.append(vector.toArray.mkString(",")).append('\n')
+    })
     w.close()
   }
 
   def normalizeTdc(tdc: RDD[Vector], size: Long): RDD[Vector] = {
     val sumVector = tdc.reduce((v1, v2) => addVectors(v1, v2))
     val tdcNorm = tdc.map(v => norm(v, sumVector, size))
-//    tdcNorm.take(10).foreach(println(_))
-//    val checkTdc = tdcNorm.reduce((v1, v2) => addVectors(v1, v2))
-//    println(checkTdc.toDense)
     tdcNorm
   }
 
@@ -146,10 +151,12 @@ object NewYorkTimesComments {
 
   def basicStats(articles: DataFrame): Unit = {
 
+    println("number of articles : " + articles.count())
+    println(articles.show(20))
     articles.describe("articleWordCount", "printPage").show()
 
-    printHist("count_word_hist.txt", articles.select("articleWordCount").map(v => v.getInt(0)).rdd.histogram(20))
-    printHist("print_page_hist.txt", articles.select("printPage").map(v => v.getInt(0)).rdd.histogram(50))
+    printHist("src/main/gnuplot/count_word_hist.txt", articles.select("articleWordCount").map(v => v.getInt(0)).rdd.histogram(20))
+    printHist("src/main/gnuplot/print_page_hist.txt", articles.select("printPage").map(v => v.getInt(0)).rdd.histogram(20))
 
     articles.groupBy("documentType").count().orderBy(desc("count")).show(100)
     articles.groupBy("newDesk").count().orderBy(desc("count")).show(100)
