@@ -12,7 +12,7 @@ import org.apache.spark.sql._
 import org.apache.spark.sql.functions._
 import org.apache.spark.ml.linalg
 import org.apache.spark.mllib.linalg.distributed._
-import org.apache.spark.mllib.linalg.{Vector, Vectors}
+import org.apache.spark.mllib.linalg.{Matrix, Vector, Vectors}
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.types._
 
@@ -67,26 +67,13 @@ object NewYorkTimesComments {
     articles.printSchema()
     println(articles.count())
     println(articles.show(50))
-    //articles.groupBy("snippet").count().orderBy(desc("count")).show()
 
     val colNames = Seq("documentType", "newDesk", "source", "typeOfMaterial")
     val tdc = disjunctiveForm(articles, colNames)
-    println(tdc._2.map(m => m.getModalities.mkString(",")).mkString(","))
-    //val tdcNorm: RDD[Vector] = normalizeTdc(tdc._1, nbArticles)
-
     val matIndividus: BlockMatrix = toBlockMatrix(new RowMatrix(tdc._1))
-    println(matIndividus.toLocalMatrix())
     val matVariables: BlockMatrix = matIndividus.transpose
-    println(matVariables.toLocalMatrix())
-
-    //val burtTable = toBlockMatrix(matVariables).multiply(toBlockMatrix(matIndividus)).toLocalMatrix()
-    //println(burtTable)
-    //writeRdd(burtTable.rows, tdc._2, "burttable.txt")
-
-
-//    val pcaResults = matVariables.computePrincipalComponentsAndExplainedVariance(2)
-//    writeRdd(matVariables.multiply(pcaResults._1).rows, "variables.csv")
-//
+    val burtTable = matVariables.multiply(matIndividus)
+    printBurtTable(burtTable.toLocalMatrix(), tdc._2, "data/burt_table.txt")
 
   }
 
@@ -94,9 +81,11 @@ object NewYorkTimesComments {
     new IndexedRowMatrix(rm.rows.zipWithIndex().map({case (row, idx) => IndexedRow(idx, row)})).toBlockMatrix()
   }
 
-  def printBurtTable(vectors: RDD[Vector], mod: Seq[QualitativeVar], filename: String): Unit = {
+  def printBurtTable(bt: Matrix, mod: Seq[QualitativeVar], filename: String): Unit = {
     println(mod.map(m => m.getModalities.mkString(",")).mkString(","))
-    vectors.map(row => row.toArray.mkString(",")).saveAsTextFile(filename)
+    val w = new FileWriter(filename)
+    w.append(bt.toString(Int.MaxValue, Int.MaxValue))
+    w.close()
   }
 
   def normalizeTdc(tdc: RDD[Vector], size: Long): RDD[Vector] = {
