@@ -8,25 +8,34 @@ import breeze.linalg.DenseVector
 import scala.collection.JavaConverters._
 import edu.stanford.nlp.pipeline.{CoreDocument, StanfordCoreNLP}
 import org.apache.log4j.{Level, LogManager}
+import org.apache.spark.broadcast.Broadcast
 import org.apache.spark.sql._
 import org.apache.spark.sql.functions._
-import org.apache.spark.ml.linalg
-import org.apache.spark.mllib.feature.Word2VecModel
 import org.apache.spark.mllib.linalg.distributed._
 import org.apache.spark.mllib.linalg.{Matrix, Vector, Vectors}
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.types._
+import breeze.linalg.{DenseVector => BDV, SparseVector => BSV, Vector => BV}
+import org.apache.spark.mllib.feature.{HashingTF, IDF, Word2Vec, Word2VecModel}
+import org.apache.spark.mllib.linalg.{Vector => SparkVector}
 
 import scala.collection.mutable
 import scala.io.Source
 
 object NewYorkTimesComments {
 
+  def toBreeze(v:SparkVector) = BV(v.toArray)
+  def fromBreeze(bv:BV[Double]): SparkVector = Vectors.dense(bv.toArray)
+  def add(v1:SparkVector, v2:SparkVector): SparkVector = fromBreeze(toBreeze(v1) + toBreeze(v2))
+  def scalarMultiply(a:Double, v:SparkVector): SparkVector = fromBreeze(a * toBreeze(v))
+
   case class QualitativeVar (name: String, modalities: Seq[String]) {
     def getModalities: Seq[String] = {
       for (modality <- modalities) yield name.toUpperCase + "." + modality
     }
   }
+
+  val w2vSize = 100
 
   val customSchema = StructType(Array(
     StructField("articleID", StringType, nullable = true),
@@ -52,7 +61,7 @@ object NewYorkTimesComments {
   val stopwords: Set[String] = Source.fromInputStream(getClass.getResourceAsStream("stopwords.txt")).getLines().toSet
 
   val sparkSession: SparkSession = SparkSession.builder.
-    master("local")
+    master("local[4]")
     .appName("NYT Comments")
     //.config("spark.driver.cores", "2")
     .getOrCreate()
@@ -62,15 +71,60 @@ object NewYorkTimesComments {
 
   def main(args: Array[String]): Unit = {
 
+    val text = "As cash has flooded Washington from a variety of groups, even the anti-establishment activists and operatives who sided with President Trump have been enriched."
     val articles: DataFrame = loadArticlesAsDF()
-    val nbArticles = articles.count()
+
     //basicStats(articles)
-    //analyseArticleTyplogy(articles)
-    val googleModel = GoogleNewsEmbeddingUtils.loadBin( "data/GoogleNews-vectors-negative300.bin")
-    println(googleModel.findSynonyms("Paris", 10))
-    googleModel.save(sparkSession.sparkContext, "GoogleNewsW2VModel")
 
+    //val googleModel = GoogleNewsEmbeddingUtils.loadBin( "data/GoogleNews-vectors-negative300.bin")
+    //val vectors = googleModel.getVectors.mapValues(vv => Vectors.dense(vv.map(_.toDouble))).map(identity)
+    //val w2vModel = sparkSession.sparkContext.broadcast(Word2VecModel.load(sparkSession.sparkContext, "w2vmodel"))
+    //val textV: Option[Vector] = computeTextW2V(w2vModel, preprocessText(text))
+    //textV.foreach(v => w2vModel.value.findSynonyms(v, 10).foreach(println(_)))
 
+    val corpus: RDD[Seq[String]] = buildW2VCorpus(articles)
+    //val idf = new IDF().fit(corpus)
+    val hashingTF = new HashingTF()
+    val tf: RDD[Vector] = hashingTF.transform(corpus)
+    tf.cache()
+    val idf = new IDF().fit(tf)
+    val tfidf: RDD[Vector] = idf.transform(tf)
+
+  }
+
+  def buildW2VCorpus(articles: DataFrame): RDD[Seq[String]] = {
+    val xmlPages: RDD[String] = LSAUtils.readFile("data/enwik8", sparkSession.sparkContext).sample(withReplacement = false, fraction = 0.1)
+    val wikipediaParagraph: RDD[(String, String)] = xmlPages.filter(_ != null).flatMap(LSAUtils.wikiXmlToPlainText).flatMap(r => {
+      r._2.split("\n").map(s => (r._1, s.trim))
+    }).filter(r => !r._2.equals(""))
+
+    val corpus = wikipediaParagraph.map(row => row._2).union(articles.rdd.map(row => row.getAs[String]("snippet")))
+    val lemmas: RDD[Seq[String]] = corpus.filter(row => row.length > 10).map(row => preprocessText(row))
+
+    println("number of paragraphs : " + lemmas.count())
+    lemmas
+  }
+
+  def buildW2VModel(corpus: RDD[Seq[String]]): Word2VecModel = {
+    val word2vec = new Word2Vec()
+    word2vec.setVectorSize(w2vSize)
+    word2vec.fit(corpus)
+  }
+
+  def computeTextW2V(model: Broadcast[Word2VecModel], text: Seq[String]): Option[Vector] = {
+    val vectSize = w2vSize
+    var vSum = Vectors.zeros(vectSize)
+    var vNb = 0
+    text.foreach(word => {
+      model.value.getVectors.get(word).foreach(v => {
+        vSum = add(Vectors.dense(v.map(_.toDouble)), vSum)
+        vNb += 1
+      })
+    })
+    if (vNb != 0) {
+      vSum = scalarMultiply(1.0 / vNb, vSum)
+    }
+    Option(vSum).filter(Vectors.norm(_, 1.0) > 0.0)
   }
 
   def analyseArticleTyplogy(articles: DataFrame): Unit = {
@@ -232,13 +286,15 @@ object NewYorkTimesComments {
     val pipeline: StanfordCoreNLP = new StanfordCoreNLP(properties)
     val document: CoreDocument = new CoreDocument(text)
     pipeline.annotate(document)
-    document.tokens().asScala.map(token => token.lemma())
+    document.tokens().asScala.map(token => token.originalText())
       .filter(token => token.length > 2)
       .filter(token => !stopwords.contains(token))
       .map(token => token.toLowerCase)
   }
 
-  def printHist(filename: String, hist: (Array[Double], Array[Long])) = {
+
+
+  def printHist(filename: String, hist: (Array[Double], Array[Long])): Unit = {
     val writer = new FileWriter(filename)
     hist._1.zip(hist._2).foreach(col => writer.append(col._1.toString).append(' ').append(col._2.toString).append('\n'))
     writer.close()

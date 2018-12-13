@@ -5,8 +5,13 @@
  */
 
 
+import com.cloudera.datascience.common.XmlInputFormat
+
 import edu.stanford.nlp.ling.CoreAnnotations.{LemmaAnnotation, SentencesAnnotation, TokensAnnotation}
 import edu.stanford.nlp.pipeline.{Annotation, StanfordCoreNLP}
+
+import edu.umd.cloud9.collection.wikipedia.WikipediaPage
+import edu.umd.cloud9.collection.wikipedia.language.EnglishWikipediaPage
 
 import java.io.{FileOutputStream, PrintStream}
 import java.util.Properties
@@ -100,6 +105,29 @@ object LSAUtils {
   def inverseDocumentFrequencies(docFreqs: Array[(String, Int)], numDocs: Int)
     : Map[String, Double] = {
     docFreqs.map{ case (term, count) => (term, math.log(numDocs.toDouble / count))}.toMap
+  }
+
+  def readFile(path: String, sc: SparkContext): RDD[String] = {
+    val conf = new Configuration()
+    conf.set(XmlInputFormat.START_TAG_KEY, "<page>")
+    conf.set(XmlInputFormat.END_TAG_KEY, "</page>")
+    val rawXmls = sc.newAPIHadoopFile(path, classOf[XmlInputFormat], classOf[LongWritable],
+      classOf[Text], conf)
+    rawXmls.map(p => p._2.toString)
+  }
+
+  /**
+    * Returns a (title, content) pair
+    */
+  def wikiXmlToPlainText(pageXml: String): Option[(String, String)] = {
+    val page = new EnglishWikipediaPage()
+    WikipediaPage.readPage(page, pageXml)
+    if (page.isEmpty || !page.isArticle || page.isRedirect ||
+      page.getTitle.contains("(disambiguation)")) {
+      None
+    } else {
+      Some((page.getTitle, page.getContent))
+    }
   }
 
   def createNLPPipeline(): StanfordCoreNLP = {

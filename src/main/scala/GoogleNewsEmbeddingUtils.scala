@@ -1,4 +1,4 @@
-import java.io.{DataInputStream, FileInputStream}
+import java.io.{BufferedInputStream, DataInputStream, FileInputStream}
 import java.util.zip.GZIPInputStream
 
 import org.apache.spark.mllib.feature.Word2VecModel
@@ -17,7 +17,7 @@ object GoogleNewsEmbeddingUtils {
       str.toString
     }
 
-    val inputStream: DataInputStream = new DataInputStream(new FileInputStream(file))
+    val inputStream: DataInputStream = new DataInputStream(new BufferedInputStream(new FileInputStream(file)))
     try {
       val header = readUntil(inputStream, '\n')
       val (records, dimensions) = header.split(" ") match {
