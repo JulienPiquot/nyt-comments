@@ -16,7 +16,9 @@ import org.apache.spark.mllib.linalg.{Matrix, Vector, Vectors}
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.types._
 import breeze.linalg.{DenseVector => BDV, SparseVector => BSV, Vector => BV}
-import org.apache.spark.mllib.feature.{HashingTF, IDF, Word2Vec, Word2VecModel}
+import org.apache.spark.ml.feature.{CountVectorizer, IDF}
+import org.apache.spark.ml.linalg.SparseVector
+import org.apache.spark.mllib.feature.{HashingTF, Word2Vec, Word2VecModel}
 import org.apache.spark.mllib.linalg.{Vector => SparkVector}
 
 import scala.collection.mutable
@@ -35,7 +37,7 @@ object NewYorkTimesComments {
     }
   }
 
-  val w2vSize = 100
+  val w2vSize = 200
 
   val customSchema = StructType(Array(
     StructField("articleID", StringType, nullable = true),
@@ -69,40 +71,69 @@ object NewYorkTimesComments {
 
   import sparkSession.implicits._
 
+//  def preprocessTextUdf() = {
+//    udf(
+//      (snippet: String) => preprocessText(snippet)
+//    )
+//  }
+
   def main(args: Array[String]): Unit = {
 
-    val text = "As cash has flooded Washington from a variety of groups, even the anti-establishment activists and operatives who sided with President Trump have been enriched."
-    val articles: DataFrame = loadArticlesAsDF()
 
+    loadArticlesAsDF().take(10).foreach(println(_))
     //basicStats(articles)
 
-    //val googleModel = GoogleNewsEmbeddingUtils.loadBin( "data/GoogleNews-vectors-negative300.bin")
-    //val vectors = googleModel.getVectors.mapValues(vv => Vectors.dense(vv.map(_.toDouble))).map(identity)
-    //val w2vModel = sparkSession.sparkContext.broadcast(Word2VecModel.load(sparkSession.sparkContext, "w2vmodel"))
-    //val textV: Option[Vector] = computeTextW2V(w2vModel, preprocessText(text))
-    //textV.foreach(v => w2vModel.value.findSynonyms(v, 10).foreach(println(_)))
+    val (articledf, bVocabulary) = compteTfIdf(loadArticlesAsDF())
 
-    val corpus: RDD[Seq[String]] = buildW2VCorpus(articles)
-    //val idf = new IDF().fit(corpus)
-    val hashingTF = new HashingTF()
-    val tf: RDD[Vector] = hashingTF.transform(corpus)
-    tf.cache()
-    val idf = new IDF().fit(tf)
-    val tfidf: RDD[Vector] = idf.transform(tf)
 
+    val w2vModel = Word2VecModel.load(sparkSession.sparkContext, "w2vmodel-enwik9")
+    //val w2vModel = buildW2VModel(buildW2VCorpus(articledf))
+    //w2vModel.save(sparkSession.sparkContext, "w2vmodel-enwik9")
+    val bW2VModel = sparkSession.sparkContext.broadcast(w2vModel)
+
+    articledf.take(10).foreach(row => {
+      println()
+      val vocabulary = bVocabulary.value
+      val snippet = row.getAs[String]("snippet")
+      println(snippet)
+      val tfidf = row.getAs[SparseVector]("snippet_tfidf")
+      val tfidfTokens = tfidf.indices.zip(tfidf.values).map(zipped => (vocabulary.apply(zipped._1), zipped._2))
+      computeTextW2V(bW2VModel.value, tfidfTokens).foreach(v => bW2VModel.value.findSynonyms(v, 10).foreach(println(_)))
+    })
+  }
+
+  def computeTextVector(model: Word2VecModel, vocabulary: Array[String], tfidf: SparseVector): Option[Vector] = {
+    val tfidfTokens = tfidf.indices.zip(tfidf.values).map(zipped => (vocabulary.apply(zipped._1), zipped._2))
+    computeTextW2V(model, tfidfTokens)
+  }
+
+  def addTextVector(model: Word2VecModel, vocabulary: Array[String], df: DataFrame): DataFrame = {
+    val compteTextVectorUdf = udf(compteTextVectorUdf)
+    df.withColumn("vector", null)
+  }
+
+  def compteTfIdf(df: DataFrame): (DataFrame, Broadcast[Array[String]]) = {
+    val preprocessTextUdf = udf(preprocessText(_))
+    var articles = df.withColumn("snippet_tokens", preprocessTextUdf($"snippet"))
+
+    val cvModel = new CountVectorizer().setInputCol("snippet_tokens").setOutputCol("snippet_count").fit(articles)
+    articles = cvModel.transform(articles)
+    val bVocabulary = sparkSession.sparkContext.broadcast(cvModel.vocabulary)
+    val idfModel = new IDF().setInputCol("snippet_count").setOutputCol("snippet_tfidf").fit(articles)
+    (idfModel.transform(articles), sparkSession.sparkContext.broadcast(cvModel.vocabulary))
   }
 
   def buildW2VCorpus(articles: DataFrame): RDD[Seq[String]] = {
-    val xmlPages: RDD[String] = LSAUtils.readFile("data/enwik8", sparkSession.sparkContext).sample(withReplacement = false, fraction = 0.1)
+    val xmlPages: RDD[String] = LSAUtils.readFile("data/enwik9", sparkSession.sparkContext).sample(withReplacement = false, fraction = 0.1)
     val wikipediaParagraph: RDD[(String, String)] = xmlPages.filter(_ != null).flatMap(LSAUtils.wikiXmlToPlainText).flatMap(r => {
       r._2.split("\n").map(s => (r._1, s.trim))
     }).filter(r => !r._2.equals(""))
 
-    val corpus = wikipediaParagraph.map(row => row._2).union(articles.rdd.map(row => row.getAs[String]("snippet")))
-    val lemmas: RDD[Seq[String]] = corpus.filter(row => row.length > 10).map(row => preprocessText(row))
-
-    println("number of paragraphs : " + lemmas.count())
-    lemmas
+    val nytLemmas = articles.rdd.map(row => row.getAs[Seq[String]]("snippet_tokens"))
+    val wikiLemmas: RDD[Seq[String]] = wikipediaParagraph.map(row => preprocessText(row._2))
+    val corpus = nytLemmas.union(wikiLemmas).filter(row => row.length > 5)
+    println("number of paragraphs : " + corpus.count())
+    corpus
   }
 
   def buildW2VModel(corpus: RDD[Seq[String]]): Word2VecModel = {
@@ -111,14 +142,16 @@ object NewYorkTimesComments {
     word2vec.fit(corpus)
   }
 
-  def computeTextW2V(model: Broadcast[Word2VecModel], text: Seq[String]): Option[Vector] = {
+  def computeTextW2V(model: Word2VecModel, tfidfTokens: Seq[(String, Double)]): Option[Vector] = {
     val vectSize = w2vSize
     var vSum = Vectors.zeros(vectSize)
-    var vNb = 0
-    text.foreach(word => {
-      model.value.getVectors.get(word).foreach(v => {
-        vSum = add(Vectors.dense(v.map(_.toDouble)), vSum)
-        vNb += 1
+    var vNb: Double = 0.0
+    tfidfTokens.foreach(x => {
+      val word: String = x._1
+      val tfidf: Double = x._2
+      model.getVectors.get(word).foreach(v => {
+        vSum = add(scalarMultiply(tfidf, Vectors.dense(v.map(_.toDouble))), vSum)
+        vNb += tfidf
       })
     })
     if (vNb != 0) {
