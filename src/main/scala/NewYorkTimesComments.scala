@@ -16,6 +16,8 @@ import org.apache.spark.mllib.linalg.{Matrix, Vector, Vectors}
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.types._
 import breeze.linalg.{DenseVector => BDV, SparseVector => BSV, Vector => BV}
+import org.apache.spark.mllib.clustering.KMeans
+import org.apache.spark.ml.evaluation.ClusteringEvaluator
 import org.apache.spark.ml.feature.{CountVectorizer, IDF}
 import org.apache.spark.ml.linalg.SparseVector
 import org.apache.spark.mllib.feature.{HashingTF, Word2Vec, Word2VecModel}
@@ -26,12 +28,15 @@ import scala.io.Source
 
 object NewYorkTimesComments {
 
-  def toBreeze(v:SparkVector) = BV(v.toArray)
-  def fromBreeze(bv:BV[Double]): SparkVector = Vectors.dense(bv.toArray)
-  def add(v1:SparkVector, v2:SparkVector): SparkVector = fromBreeze(toBreeze(v1) + toBreeze(v2))
-  def scalarMultiply(a:Double, v:SparkVector): SparkVector = fromBreeze(a * toBreeze(v))
+  def toBreeze(v: SparkVector) = BV(v.toArray)
 
-  case class QualitativeVar (name: String, modalities: Seq[String]) {
+  def fromBreeze(bv: BV[Double]): SparkVector = Vectors.dense(bv.toArray)
+
+  def add(v1: SparkVector, v2: SparkVector): SparkVector = fromBreeze(toBreeze(v1) + toBreeze(v2))
+
+  def scalarMultiply(a: Double, v: SparkVector): SparkVector = fromBreeze(a * toBreeze(v))
+
+  case class QualitativeVar(name: String, modalities: Seq[String]) {
     def getModalities: Seq[String] = {
       for (modality <- modalities) yield name.toUpperCase + "." + modality
     }
@@ -71,45 +76,48 @@ object NewYorkTimesComments {
 
   import sparkSession.implicits._
 
-//  def preprocessTextUdf() = {
-//    udf(
-//      (snippet: String) => preprocessText(snippet)
-//    )
-//  }
 
   def main(args: Array[String]): Unit = {
 
 
-    loadArticlesAsDF().take(10).foreach(println(_))
+    val (articledf, bVocabulary) = compteTfIdf(loadArticlesAsDF().sample(0.25))
+    println("df size = " + articledf.count())
     //basicStats(articles)
-
-    val (articledf, bVocabulary) = compteTfIdf(loadArticlesAsDF())
 
 
     val w2vModel = Word2VecModel.load(sparkSession.sparkContext, "w2vmodel-enwik9")
-    //val w2vModel = buildW2VModel(buildW2VCorpus(articledf))
-    //w2vModel.save(sparkSession.sparkContext, "w2vmodel-enwik9")
     val bW2VModel = sparkSession.sparkContext.broadcast(w2vModel)
+    val vectorised = addSnippetVector(bW2VModel.value, bVocabulary.value, articledf)
 
-    articledf.take(10).foreach(row => {
-      println()
-      val vocabulary = bVocabulary.value
-      val snippet = row.getAs[String]("snippet")
-      println(snippet)
-      val tfidf = row.getAs[SparseVector]("snippet_tfidf")
-      val tfidfTokens = tfidf.indices.zip(tfidf.values).map(zipped => (vocabulary.apply(zipped._1), zipped._2))
-      computeTextW2V(bW2VModel.value, tfidfTokens).foreach(v => bW2VModel.value.findSynonyms(v, 10).foreach(println(_)))
-    })
+    lsa(articledf, "headline", "snippet")
+
+    kmeans(vectorised, 2, null)
+
   }
 
-  def computeTextVector(model: Word2VecModel, vocabulary: Array[String], tfidf: SparseVector): Option[Vector] = {
+  def kmeans(vectorised: DataFrame, k: Int, w2v: Word2VecModel): Array[Vector] = {
+    val featuresRDD: RDD[org.apache.spark.mllib.linalg.Vector] = vectorised.rdd.map(row => row.getAs[org.apache.spark.mllib.linalg.Vector]("vector")).cache()
+    val kmeans = new KMeans().setK(k).setSeed(1L)
+    val kmModel = kmeans.run(featuresRDD)
+    if (w2v != null) {
+      kmModel.clusterCenters.foreach((centroid: org.apache.spark.mllib.linalg.Vector) => {
+        println("####")
+        w2v.findSynonyms(centroid, 10).foreach(println(_))
+      })
+    }
+    println("cost" + kmModel.computeCost(featuresRDD))
+    kmModel.clusterCenters
+  }
+
+  def computeTextVector(model: Word2VecModel, vocabulary: Array[String], tfidf: SparseVector): Vector = {
     val tfidfTokens = tfidf.indices.zip(tfidf.values).map(zipped => (vocabulary.apply(zipped._1), zipped._2))
     computeTextW2V(model, tfidfTokens)
   }
 
-  def addTextVector(model: Word2VecModel, vocabulary: Array[String], df: DataFrame): DataFrame = {
-    val compteTextVectorUdf = udf(compteTextVectorUdf)
-    df.withColumn("vector", null)
+  def addSnippetVector(model: Word2VecModel, vocabulary: Array[String], df: DataFrame): DataFrame = {
+    val compteTextVectorUdf = udf((x: SparseVector) => computeTextVector(model, vocabulary, x))
+    df.withColumn("vector", compteTextVectorUdf($"snippet_tfidf"))
+      .filter(row => org.apache.spark.ml.linalg.Vectors.norm(row.getAs[org.apache.spark.ml.linalg.Vector]("snippet_tfidf"), 1.0) > 0.0)
   }
 
   def compteTfIdf(df: DataFrame): (DataFrame, Broadcast[Array[String]]) = {
@@ -142,7 +150,7 @@ object NewYorkTimesComments {
     word2vec.fit(corpus)
   }
 
-  def computeTextW2V(model: Word2VecModel, tfidfTokens: Seq[(String, Double)]): Option[Vector] = {
+  def computeTextW2V(model: Word2VecModel, tfidfTokens: Seq[(String, Double)]): Vector = {
     val vectSize = w2vSize
     var vSum = Vectors.zeros(vectSize)
     var vNb: Double = 0.0
@@ -157,7 +165,7 @@ object NewYorkTimesComments {
     if (vNb != 0) {
       vSum = scalarMultiply(1.0 / vNb, vSum)
     }
-    Option(vSum).filter(Vectors.norm(_, 1.0) > 0.0)
+    vSum
   }
 
   def analyseArticleTyplogy(articles: DataFrame): Unit = {
@@ -170,7 +178,7 @@ object NewYorkTimesComments {
   }
 
   def toBlockMatrix(rm: RowMatrix): BlockMatrix = {
-    new IndexedRowMatrix(rm.rows.zipWithIndex().map({case (row, idx) => IndexedRow(idx, row)})).toBlockMatrix()
+    new IndexedRowMatrix(rm.rows.zipWithIndex().map({ case (row, idx) => IndexedRow(idx, row) })).toBlockMatrix()
   }
 
   def printBurtTable(bt: Matrix, mod: Seq[QualitativeVar], filename: String): Unit = {
@@ -224,7 +232,7 @@ object NewYorkTimesComments {
     val (termDocMatrix, termIds, docIds, idfs) =
       LSAUtils.termDocumentMatrix(tokens, numTerms, sparkSession.sparkContext)
     val mat = new RowMatrix(termDocMatrix)
-    val k = 20
+    val k = 10
     val svd = mat.computeSVD(k, computeU = true)
 
     val topConceptTerms = RunLSA.topTermsInTopConcepts(svd, 10, 10, termIds)
@@ -324,7 +332,6 @@ object NewYorkTimesComments {
       .filter(token => !stopwords.contains(token))
       .map(token => token.toLowerCase)
   }
-
 
 
   def printHist(filename: String, hist: (Array[Double], Array[Long])): Unit = {
