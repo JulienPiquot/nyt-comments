@@ -79,19 +79,22 @@ object NewYorkTimesComments {
 
   def main(args: Array[String]): Unit = {
 
+    println(preprocessText("Bob lives in New-York"))
 
-    val (articledf, bVocabulary) = compteTfIdf(loadArticlesAsDF().sample(0.25))
-    println("df size = " + articledf.count())
-    //basicStats(articles)
+    val (articledf, bVocabulary) = compteTfIdf(loadArticlesAsDF())
+    //basicStats(articledf)
 
 
-    val w2vModel = Word2VecModel.load(sparkSession.sparkContext, "w2vmodel-enwik9")
+    //val w2vModel = Word2VecModel.load(sparkSession.sparkContext, "w2vmodel-enwik9")
+    val w2vModel = buildW2VModel(buildW2VCorpus(articledf))
     val bW2VModel = sparkSession.sparkContext.broadcast(w2vModel)
     val vectorised = addSnippetVector(bW2VModel.value, bVocabulary.value, articledf)
-
-    lsa(articledf, "headline", "snippet")
-
-    kmeans(vectorised, 2, null)
+    vectorised.take(10).foreach(row => {
+      println(row.getAs[String]("snippet"))
+      w2vModel.findSynonyms(row.getAs[Vector]("vector"), 5).foreach(println(_))
+    })
+    //lsa(articledf, "headline", "snippet")
+    //kmeans(vectorised, 2, null)
 
   }
 
@@ -139,7 +142,8 @@ object NewYorkTimesComments {
 
     val nytLemmas = articles.rdd.map(row => row.getAs[Seq[String]]("snippet_tokens"))
     val wikiLemmas: RDD[Seq[String]] = wikipediaParagraph.map(row => preprocessText(row._2))
-    val corpus = nytLemmas.union(wikiLemmas).filter(row => row.length > 5)
+    val corpus = nytLemmas.filter(row => row.length > 5)
+    //val corpus = nytLemmas.union(wikiLemmas).filter(row => row.length > 5)
     println("number of paragraphs : " + corpus.count())
     corpus
   }
@@ -327,10 +331,10 @@ object NewYorkTimesComments {
     val pipeline: StanfordCoreNLP = new StanfordCoreNLP(properties)
     val document: CoreDocument = new CoreDocument(text)
     pipeline.annotate(document)
-    document.tokens().asScala.map(token => token.originalText())
-      .filter(token => token.length > 2)
-      .filter(token => !stopwords.contains(token))
-      .map(token => token.toLowerCase)
+    document.tokens().asScala.map(token => token.lemma())
+      .filter(lemma => lemma.length > 2)
+      .filter(lemma => !stopwords.contains(lemma))
+      .map(lemma => lemma.toLowerCase)
   }
 
 
