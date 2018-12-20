@@ -1,5 +1,6 @@
 import java.io.FileWriter
 import java.sql.Timestamp
+import java.util
 import java.util.Properties
 
 import au.com.bytecode.opencsv.CSVParser
@@ -124,7 +125,7 @@ object NewYorkTimesComments {
   }
 
   def compteTfIdf(df: DataFrame): (DataFrame, Broadcast[Array[String]]) = {
-    val preprocessTextUdf = udf(preprocessText(_))
+    val preprocessTextUdf = udf((t: String) => preprocessText(t))
     var articles = df.withColumn("snippet_tokens", preprocessTextUdf($"snippet"))
 
     val cvModel = new CountVectorizer().setInputCol("snippet_tokens").setOutputCol("snippet_count").fit(articles)
@@ -292,14 +293,14 @@ object NewYorkTimesComments {
   def parseCsvRow(headers: Seq[String], row: String): Row = {
     val parser: CSVParser = new CSVParser(',', '"')
     val article = parser.parseLine(row)
-    val articleFields: mutable.TreeMap[String, Any] = mutable.TreeMap()
-    article.zip(headers).foreach(articleField => articleFields(articleField._2) = convert(articleField._2, articleField._1))
+    val articleFields: util.TreeMap[String, Any] = new util.TreeMap()
+    article.zip(headers).foreach(articleField => articleFields.put(articleField._2, convert(articleField._2, articleField._1)))
     articleFields.remove("abstract")
     articleFields.remove("multimedia")
     if (articleFields.size != 14) {
       throw new Exception("an article should have 14 fields")
     }
-    Row.fromSeq(articleFields.values.toSeq)
+    Row.fromSeq(articleFields.values.asScala.toSeq)
   }
 
   def convert(fieldName: String, fieldValue: String): Any = {
