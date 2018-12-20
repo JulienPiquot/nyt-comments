@@ -27,8 +27,9 @@ object KafkaIntegration {
     "key.deserializer" -> classOf[StringDeserializer],
     "value.deserializer" -> classOf[StringDeserializer],
     "group.id" -> "test_group",
-    "auto.offset.reset" -> "latest",
-    "enable.auto.commit" -> (false: java.lang.Boolean)
+    //"auto.offset.reset" -> "latest",
+    "enable.auto.commit" -> (false: java.lang.Boolean),
+    "auto.offset.reset" -> "earliest"
   )
 
   def main(args: Array[String]): Unit = {
