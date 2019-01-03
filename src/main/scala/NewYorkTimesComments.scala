@@ -45,7 +45,26 @@ object NewYorkTimesComments {
 
   val w2vSize = 200
 
-  val customSchema = StructType(Array(
+  val commentSchema = StructType(Array(
+    StructField("commentID", IntegerType, nullable = true),
+    StructField("commentBody", StringType, nullable = true),
+    StructField("commentType", StringType, nullable = true),
+    StructField("createDate", TimestampType, nullable = true),
+    StructField("depth", IntegerType, nullable = true),
+    StructField("editorsSelection", BooleanType, nullable = true),
+    StructField("recommandations", IntegerType, nullable = true),
+    StructField("replyCount", IntegerType, nullable = true),
+    StructField("sharing", IntegerType, nullable = true),
+    StructField("userDisplayName", StringType, nullable = true),
+    StructField("userLocation", StringType, nullable = true),
+    StructField("articleID", StringType, nullable = true),
+    StructField("newDesk", StringType, nullable = true),
+    StructField("articleWordCount", IntegerType, nullable = true),
+    StructField("printPage", IntegerType, nullable = true),
+    StructField("typeOfMaterial", StringType, nullable = true)
+  ))
+
+  val articlesSchema = StructType(Array(
     StructField("articleID", StringType, nullable = true),
     StructField("articleWordCount", IntegerType, nullable = true),
     StructField("byline", StringType, nullable = true),
@@ -82,14 +101,14 @@ object NewYorkTimesComments {
 
     println(preprocessText("Bob lives in New-York"))
 
-    val (articledf, bVocabulary) = compteTfIdf(loadArticlesAsDF())
+    val (articledf, bVocabulary) = compteAndCacheTfIdf(loadArticlesAsDF(), "snippet")
     //basicStats(articledf)
 
 
     //val w2vModel = Word2VecModel.load(sparkSession.sparkContext, "w2vmodel-enwik9")
     val w2vModel = buildW2VModel(buildW2VCorpus(articledf))
     val bW2VModel = sparkSession.sparkContext.broadcast(w2vModel)
-    val vectorised = addSnippetVector(bW2VModel.value, bVocabulary.value, articledf)
+    val vectorised = addVector(bW2VModel.value, bVocabulary.value, articledf)
     vectorised.take(10).foreach(row => {
       println(row.getAs[String]("snippet"))
       w2vModel.findSynonyms(row.getAs[Vector]("vector"), 5).foreach(println(_))
@@ -118,34 +137,34 @@ object NewYorkTimesComments {
     computeTextW2V(model, tfidfTokens)
   }
 
-  def addSnippetVector(model: Word2VecModel, vocabulary: Array[String], df: DataFrame): DataFrame = {
+  def addVector(model: Word2VecModel, vocabulary: Array[String], df: DataFrame): DataFrame = {
     val compteTextVectorUdf = udf((x: SparseVector) => computeTextVector(model, vocabulary, x))
-    df.withColumn("vector", compteTextVectorUdf($"snippet_tfidf"))
-      .filter(row => org.apache.spark.ml.linalg.Vectors.norm(row.getAs[org.apache.spark.ml.linalg.Vector]("snippet_tfidf"), 1.0) > 0.0)
+    df.withColumn("vector", compteTextVectorUdf($"tfidf"))
+      .filter(row => org.apache.spark.ml.linalg.Vectors.norm(row.getAs[org.apache.spark.ml.linalg.Vector]("tfidf"), 1.0) > 0.0)
   }
 
-  def compteTfIdf(df: DataFrame): (DataFrame, Broadcast[Array[String]]) = {
+  def compteAndCacheTfIdf(df: DataFrame, colName: String): (DataFrame, Broadcast[Array[String]]) = {
     val preprocessTextUdf = udf((t: String) => preprocessText(t))
-    var articles = df.withColumn("snippet_tokens", preprocessTextUdf($"snippet"))
+    var articles = df.withColumn("tokens", preprocessTextUdf(col(colName)))
 
-    val cvModel = new CountVectorizer().setInputCol("snippet_tokens").setOutputCol("snippet_count").fit(articles)
+    val cvModel = new CountVectorizer().setInputCol("tokens").setOutputCol("token_count").fit(articles)
     articles = cvModel.transform(articles)
     val bVocabulary = sparkSession.sparkContext.broadcast(cvModel.vocabulary)
-    val idfModel = new IDF().setInputCol("snippet_count").setOutputCol("snippet_tfidf").fit(articles)
-    (idfModel.transform(articles), sparkSession.sparkContext.broadcast(cvModel.vocabulary))
+    val idfModel = new IDF().setInputCol("token_count").setOutputCol("tfidf").fit(articles)
+    (idfModel.transform(articles).cache(), sparkSession.sparkContext.broadcast(cvModel.vocabulary))
   }
 
   def buildW2VCorpus(articles: DataFrame): RDD[Seq[String]] = {
-    val xmlPages: RDD[String] = LSAUtils.readFile("data/enwik9", sparkSession.sparkContext).sample(withReplacement = false, fraction = 0.1)
-    val wikipediaParagraph: RDD[(String, String)] = xmlPages.filter(_ != null).flatMap(LSAUtils.wikiXmlToPlainText).flatMap(r => {
-      r._2.split("\n").map(s => (r._1, s.trim))
-    }).filter(r => !r._2.equals(""))
+//    val xmlPages: RDD[String] = LSAUtils.readFile("data/enwik9", sparkSession.sparkContext).sample(withReplacement = false, fraction = 0.1)
+//    val wikipediaParagraph: RDD[(String, String)] = xmlPages.filter(_ != null).flatMap(LSAUtils.wikiXmlToPlainText).flatMap(r => {
+//      r._2.split("\n").map(s => (r._1, s.trim))
+//    }).filter(r => !r._2.equals(""))
 
-    val nytLemmas = articles.rdd.map(row => row.getAs[Seq[String]]("snippet_tokens"))
-    val wikiLemmas: RDD[Seq[String]] = wikipediaParagraph.map(row => preprocessText(row._2))
+    val nytLemmas = articles.rdd.map(row => row.getAs[Seq[String]]("tokens"))
+//    val wikiLemmas: RDD[Seq[String]] = wikipediaParagraph.map(row => preprocessText(row._2))
     val corpus = nytLemmas.filter(row => row.length > 5)
     //val corpus = nytLemmas.union(wikiLemmas).filter(row => row.length > 5)
-    println("number of paragraphs : " + corpus.count())
+    //println("number of paragraphs : " + corpus.count())
     corpus
   }
 
@@ -323,7 +342,7 @@ object NewYorkTimesComments {
       }).map(row => parseCsvRow(headers, row))
       allRDD = allRDD.union(articleRDD)
     }
-    sparkSession.createDataFrame(allRDD, customSchema)
+    sparkSession.createDataFrame(allRDD, articlesSchema)
   }
 
   def preprocessText(text: String): Seq[String] = {
