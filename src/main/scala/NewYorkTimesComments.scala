@@ -107,7 +107,7 @@ object NewYorkTimesComments {
 
     //val w2vModel = Word2VecModel.load(sparkSession.sparkContext, "w2vmodel-enwik9")
     val w2vModel = buildW2VModel(buildW2VCorpus(articledf))
-    val bW2VModel = sparkSession.sparkContext.broadcast(w2vModel)
+    val bW2VModel = sparkSession.sparkContext.broadcast(w2vModel.getVectors)
     val vectorised = addVector(bW2VModel.value, bVocabulary.value, articledf)
     vectorised.take(10).foreach(row => {
       println(row.getAs[String]("snippet"))
@@ -128,24 +128,25 @@ object NewYorkTimesComments {
         w2v.findSynonyms(centroid, 10).foreach(println(_))
       })
     }
-    println("cost" + kmModel.computeCost(featuresRDD))
+    println("cost : " + kmModel.computeCost(featuresRDD))
+    featuresRDD.unpersist(false)
     kmModel.clusterCenters
   }
 
-  def computeTextVector(model: Word2VecModel, vocabulary: Array[String], tfidf: SparseVector): Vector = {
-    val tfidfTokens = tfidf.indices.zip(tfidf.values).map(zipped => (vocabulary.apply(zipped._1), zipped._2))
-    computeTextW2V(model, tfidfTokens)
+  def computeTextVector(w2vVectors: Map[String, Array[Float]], vocabulary: Array[String], tfidf: SparseVector): Vector = {
+    val tfidfTokens = tfidf.indices.zip(tfidf.values).map(zipped => (vocabulary(zipped._1), zipped._2))
+    computeTextW2V(w2vVectors, tfidfTokens)
   }
 
-  def addVector(model: Word2VecModel, vocabulary: Array[String], df: DataFrame): DataFrame = {
-    val compteTextVectorUdf = udf((x: SparseVector) => computeTextVector(model, vocabulary, x))
+  def addVector(w2vVectors: Map[String, Array[Float]], vocabulary: Array[String], df: DataFrame): DataFrame = {
+    val compteTextVectorUdf = udf((x: SparseVector) => computeTextVector(w2vVectors, vocabulary, x))
     df.withColumn("vector", compteTextVectorUdf($"tfidf"))
       .filter(row => org.apache.spark.ml.linalg.Vectors.norm(row.getAs[org.apache.spark.ml.linalg.Vector]("tfidf"), 1.0) > 0.0)
   }
 
   def compteAndCacheTfIdf(df: DataFrame, colName: String): (DataFrame, Broadcast[Array[String]]) = {
     val preprocessTextUdf = udf((t: String) => preprocessText(t))
-    var articles = df.withColumn("tokens", preprocessTextUdf(col(colName)))
+    var articles = df.withColumn("tokens", preprocessTextUdf(col(colName))).cache()
 
     val cvModel = new CountVectorizer().setInputCol("tokens").setOutputCol("token_count").fit(articles)
     articles = cvModel.transform(articles)
@@ -171,17 +172,18 @@ object NewYorkTimesComments {
   def buildW2VModel(corpus: RDD[Seq[String]]): Word2VecModel = {
     val word2vec = new Word2Vec()
     word2vec.setVectorSize(w2vSize)
+    word2vec.setNumPartitions(corpus.getNumPartitions)
     word2vec.fit(corpus)
   }
 
-  def computeTextW2V(model: Word2VecModel, tfidfTokens: Seq[(String, Double)]): Vector = {
+  def computeTextW2V(w2vVectors: Map[String, Array[Float]], tfidfTokens: Seq[(String, Double)]): Vector = {
     val vectSize = w2vSize
     var vSum = Vectors.zeros(vectSize)
     var vNb: Double = 0.0
     tfidfTokens.foreach(x => {
       val word: String = x._1
       val tfidf: Double = x._2
-      model.getVectors.get(word).foreach(v => {
+      w2vVectors.get(word).foreach(v => {
         vSum = add(scalarMultiply(tfidf, Vectors.dense(v.map(_.toDouble))), vSum)
         vNb += tfidf
       })

@@ -16,9 +16,10 @@ import org.apache.spark.streaming.kafka010.ConsumerStrategies.Subscribe
 object KafkaIntegration {
 
   val sparkSession: SparkSession = SparkSession.builder.
-    master("local[4]")
+    master("local[*]")
     .appName("NYT Comments")
-    //.config("spark.driver.cores", "2")
+    //.config("spark.driver.cores", "4")
+    //.config("spark.executor.cores", "4")
     .getOrCreate()
   LogManager.getRootLogger.setLevel(Level.WARN)
   //val ssc = new StreamingContext(sparkSession.sparkContext, Seconds(10))
@@ -37,8 +38,8 @@ object KafkaIntegration {
   )
 
   def main(args: Array[String]): Unit = {
-    val comments: RDD[Comment] = buildCommentsRdd(sparkSession.sparkContext).sample(withReplacement = false, fraction = 0.5)
-    comments.take(10).foreach(println(_))
+    val comments: RDD[Comment] = buildCommentsRdd(sparkSession.sparkContext).sample(withReplacement = false, fraction = 0.25).repartition(24)
+    //comments.take(10).foreach(println(_))
     println("number of partitions : " + comments.getNumPartitions)
     println("number of comments : " + comments.count())
 
@@ -47,24 +48,27 @@ object KafkaIntegration {
     val commentDF = sparkSession.createDataFrame(comments.map(c => Row.fromSeq(Seq(c.getCommentID, c.getCommentBody, c.getCommentType, c.getCreateDate, c.getDepth, c.isEditorsSelection, c.getRecommandations, c.getReplyCount, c.getSharing, c.getUserDisplayName, c.getUseLocation, c.getArticleID, c.getNewDesk, c.getArticleWordCount, c.getPrintPage, c.getTypeOfMaterial))),
       NewYorkTimesComments.commentSchema).cache()
     val (commentDF2, bVocabulary) = compteAndCacheTfIdf(commentDF, "commentBody")
-    val corpus = buildW2VCorpus(commentDF2)
-    //println("number of paragraphs : " + corpus.count())
+    commentDF2.limit(10).foreach(print(_))
+    println("number of partitions commentDF2 : " + commentDF2.rdd.getNumPartitions)
+    val corpus = buildW2VCorpus(commentDF2).cache()
+    println("number of paragraphs : " + corpus.count())
+    println("number of partitions corpus : " + corpus.getNumPartitions)
     val w2vModel = buildW2VModel(corpus)
-    w2vModel.save(sparkSession.sparkContext, "comments-w2v")
-    val bW2VModel = sparkSession.sparkContext.broadcast(w2vModel)
+//    w2vModel.save(sparkSession.sparkContext, "comments-w2v")
+    val bW2VModel = sparkSession.sparkContext.broadcast(w2vModel.getVectors)
     val vectorised = addVector(bW2VModel.value, bVocabulary.value, commentDF2).cache()
+    println("number of vectorized paritions : " + vectorised.rdd.getNumPartitions)
     println("### embeddings ###")
-    vectorised.take(10).foreach(row => {
+    vectorised.head(10).foreach(row => {
       println(row.getAs[String]("commentBody"))
       w2vModel.findSynonyms(row.getAs[Vector]("vector"), 10).foreach(println(_))
     })
-    println("### kmeans ###")
-    kmeans(vectorised, 10, w2vModel)
-    println("### lsa ###")
-    lsa(commentDF, "commentID", "commentBody")
-
-
-
+    for (i <- 1 to 20) {
+      println("### kmeans k = " + i + " ###")
+      kmeans(vectorised, i, null)
+    }
+//    println("### lsa ###")
+//    lsa(commentDF, "commentID", "commentBody")
   }
 
   def computeAnova(comments: RDD[Comment]): Unit = {
