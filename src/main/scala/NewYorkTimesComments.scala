@@ -124,7 +124,7 @@ object NewYorkTimesComments {
     val kmModel = kmeans.run(featuresRDD)
     if (w2v != null) {
       kmModel.clusterCenters.foreach((centroid: org.apache.spark.mllib.linalg.Vector) => {
-        println("####")
+        println("#### class synonyms ####")
         w2v.findSynonyms(centroid, 10).foreach(println(_))
       })
     }
@@ -252,8 +252,7 @@ object NewYorkTimesComments {
     (df.rdd.map(row => rowToVector(row, vars)), vars)
   }
 
-  def lsa(df: DataFrame, titleCol: String, textCol: String) = {
-    val tokens: RDD[(String, Seq[String])] = df.map(row => (row.getAs[String](titleCol), preprocessText(row.getAs(textCol)))).rdd
+  def lsa(tokens: RDD[(String, Seq[String])]): Unit = {
     val numTerms = 1000
     val (termDocMatrix, termIds, docIds, idfs) =
       LSAUtils.termDocumentMatrix(tokens, numTerms, sparkSession.sparkContext)
@@ -268,6 +267,16 @@ object NewYorkTimesComments {
       println("Concept docs: " + docs.map(_._1).mkString("|"))
       println()
     }
+  }
+
+  def lsa(df: DataFrame, titleCol: String, textCol: String, preprocess: Boolean): Unit = {
+    val tokens = if (preprocess) {
+      df.map(row => (row.getAs[String](titleCol), preprocessText(row.getAs(textCol)))).rdd
+    } else {
+      df.filter(row => row.getAs[Seq[String]](textCol).size > 10)
+        .map(row => (row.getAs[String](titleCol), row.getAs[Seq[String]](textCol))).rdd
+    }
+    lsa(tokens)
   }
 
   def basicStats(articles: DataFrame): Unit = {
