@@ -99,20 +99,20 @@ object NewYorkTimesComments {
 
   def main(args: Array[String]): Unit = {
 
-    println(preprocessText("Bob lives in New-York"))
+    println(sentimentAnalysis("Bob lives in New-York, he likes it a lot. But Jane hates it. The cat is black."))
 
     val (articledf, bVocabulary) = compteAndCacheTfIdf(loadArticlesAsDF(), "snippet")
-    //basicStats(articledf)
+    basicStats(articledf)
 
 
     //val w2vModel = Word2VecModel.load(sparkSession.sparkContext, "w2vmodel-enwik9")
-    val w2vModel = buildW2VModel(buildW2VCorpus(articledf))
-    val bW2VModel = sparkSession.sparkContext.broadcast(w2vModel.getVectors)
-    val vectorised = addVector(bW2VModel.value, bVocabulary.value, articledf)
-    vectorised.take(10).foreach(row => {
-      println(row.getAs[String]("snippet"))
-      w2vModel.findSynonyms(row.getAs[Vector]("vector"), 5).foreach(println(_))
-    })
+//    val w2vModel = buildW2VModel(buildW2VCorpus(articledf))
+//    val bW2VModel = sparkSession.sparkContext.broadcast(w2vModel.getVectors)
+//    val vectorised = addVector(bW2VModel.value, bVocabulary.value, articledf)
+//    vectorised.take(10).foreach(row => {
+//      println(row.getAs[String]("snippet"))
+//      w2vModel.findSynonyms(row.getAs[Vector]("vector"), 5).foreach(println(_))
+//    })
     //lsa(articledf, "headline", "snippet")
     //kmeans(vectorised, 2, null)
 
@@ -366,6 +366,15 @@ object NewYorkTimesComments {
       .filter(lemma => lemma.length > 2)
       .filter(lemma => !stopwords.contains(lemma))
       .map(lemma => lemma.toLowerCase)
+  }
+
+  def sentimentAnalysis(text: String): Seq[String] = {
+    val properties = new Properties()
+    properties.setProperty("annotators", "tokenize, ssplit, pos, lemma, parse, sentiment")
+    val pipeline: StanfordCoreNLP = new StanfordCoreNLP(properties)
+    val document: CoreDocument = new CoreDocument(text)
+    pipeline.annotate(document)
+    document.sentences().asScala.map(sentence => sentence.sentiment())
   }
 
 

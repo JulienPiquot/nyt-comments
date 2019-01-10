@@ -45,7 +45,7 @@ object KafkaIntegration {
   )
 
   def main(args: Array[String]): Unit = {
-    val comments: RDD[Comment] = buildCommentsRdd(sparkSession.sparkContext).sample(withReplacement = false, fraction = 0.25).repartition(24)
+    val comments: RDD[Comment] = buildCommentsRdd(sparkSession.sparkContext).sample(withReplacement = false, fraction = 0.25d).repartition(24)
 
     // calcul de l'ANOVA - rejet de l'hypothèse nulle potentiellement due a un effet "Big Data"
     //computeAnova(comments)
@@ -78,23 +78,27 @@ object KafkaIntegration {
   }
 
   def runDecisionTree(comments: DataFrame) = {
-    val toMLVector = udf((v: Vector) => new org.apache.spark.ml.linalg.DenseVector(v.toArray))
-    val data: DataFrame = comments.withColumn("mlvector", toMLVector($"vector")).cache()
+    val toMLVector = udf((v: Vector, wc: Int, printPage: Int, typeOfMaterial: String, newDesk: String) => new org.apache.spark.ml.linalg.DenseVector(v.toArray ++ Array(wc.toDouble, printPage.toDouble, typeOfMaterial.hashCode.toDouble, newDesk.hashCode.toDouble)))
+    val data: DataFrame = comments.withColumn("mlvector", toMLVector($"vector", $"articleWordCount", $"printPage", $"typeOfMaterial", $"newDesk")).cache()
 
     val featureIndexer = new VectorIndexer()
       .setInputCol("mlvector")
       .setOutputCol("indexedVector")
+      .setMaxCategories(60)
       .fit(data)
     val Array(trainingData, testData) = data.randomSplit(Array(0.7, 0.3))
     val dt = new DecisionTreeRegressor()
-      .setLabelCol("articleWordCount")
+      .setMaxDepth(10)
+      .setMaxBins(64)
+      .setMinInstancesPerNode(2)
+      .setLabelCol("recommandations")
       .setFeaturesCol("indexedVector")
     val pipeline = new Pipeline().setStages(Array(featureIndexer, dt))
     val model = pipeline.fit(trainingData)
     val predictions = model.transform(testData)
-    predictions.select("prediction", "articleWordCount", "indexedVector").show(5)
+    predictions.select("prediction", "recommandations", "indexedVector").show(5)
     val evaluator = new RegressionEvaluator()
-      .setLabelCol("articleWordCount")
+      .setLabelCol("recommandations")
       .setPredictionCol("prediction")
       .setMetricName("rmse")
     val rmse = evaluator.evaluate(predictions)
