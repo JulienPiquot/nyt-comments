@@ -99,10 +99,10 @@ object NewYorkTimesComments {
 
   def main(args: Array[String]): Unit = {
 
-    println(sentimentAnalysis("Bob lives in New-York, he likes it a lot. But Jane hates it. The cat is black."))
+    println(sentimentAnalysis("Bob lives in New-York, he likes it a lot. But Jane hates it."))
 
-    val (articledf, bVocabulary) = compteAndCacheTfIdf(loadArticlesAsDF(), "snippet")
-    basicStats(articledf)
+    //val (articledf, bVocabulary) = compteAndCacheTfIdf(loadArticlesAsDF(), "snippet")
+    //basicStats(articledf)
 
 
     //val w2vModel = Word2VecModel.load(sparkSession.sparkContext, "w2vmodel-enwik9")
@@ -147,12 +147,15 @@ object NewYorkTimesComments {
   def compteAndCacheTfIdf(df: DataFrame, colName: String): (DataFrame, Broadcast[Array[String]]) = {
     val preprocessTextUdf = udf((t: String) => preprocessText(t))
     var articles = df.withColumn("tokens", preprocessTextUdf(col(colName))).cache()
+    compteAndCacheTfIdf(articles)
+  }
 
+  def compteAndCacheTfIdf(articles: DataFrame): (DataFrame, Broadcast[Array[String]]) = {
     val cvModel = new CountVectorizer().setInputCol("tokens").setOutputCol("token_count").fit(articles)
-    articles = cvModel.transform(articles)
+    val articlesCount = cvModel.transform(articles)
     val bVocabulary = sparkSession.sparkContext.broadcast(cvModel.vocabulary)
-    val idfModel = new IDF().setInputCol("token_count").setOutputCol("tfidf").fit(articles)
-    (idfModel.transform(articles).cache(), sparkSession.sparkContext.broadcast(cvModel.vocabulary))
+    val idfModel = new IDF().setInputCol("token_count").setOutputCol("tfidf").fit(articlesCount)
+    (idfModel.transform(articlesCount), sparkSession.sparkContext.broadcast(cvModel.vocabulary))
   }
 
   def buildW2VCorpus(articles: DataFrame): RDD[Seq[String]] = {
@@ -270,7 +273,7 @@ object NewYorkTimesComments {
   }
 
   def lsa(df: DataFrame, titleCol: String, textCol: String, preprocess: Boolean): Unit = {
-    val tokens = if (preprocess) {
+    val tokens: RDD[(String, Seq[String])] = if (preprocess) {
       df.map(row => (row.getAs[String](titleCol), preprocessText(row.getAs(textCol)))).rdd
     } else {
       df.filter(row => row.getAs[Seq[String]](textCol).size > 10)
@@ -368,13 +371,32 @@ object NewYorkTimesComments {
       .map(lemma => lemma.toLowerCase)
   }
 
-  def sentimentAnalysis(text: String): Seq[String] = {
+  case class NlpResult(tokens: Seq[String], sentiments: Vector)
+
+  def sentimentAnalysis(text: String): NlpResult = {
+    val start = System.nanoTime();
     val properties = new Properties()
-    properties.setProperty("annotators", "tokenize, ssplit, pos, lemma, parse, sentiment")
+    properties.setProperty("annotators", "tokenize, ssplit, pos, lemma")
+    //properties.setProperty("annotators", "tokenize, ssplit, pos, lemma, parse, sentiment")
     val pipeline: StanfordCoreNLP = new StanfordCoreNLP(properties)
     val document: CoreDocument = new CoreDocument(text)
     pipeline.annotate(document)
-    document.sentences().asScala.map(sentence => sentence.sentiment())
+    val sentiments = document.sentences().asScala.map(sentence => sentence.sentiment()).groupBy(identity).mapValues(_.size)
+    val pos = sentiments.getOrElse("Positive", 0)
+    val neg = sentiments.getOrElse("Negative", 0)
+    val neut = sentiments.getOrElse("Neutral", 0)
+    var total = (pos + neg + neut).toDouble
+    total = if (total == 0) 1 else total
+    //println("sentiment analysis run in " + (System.nanoTime() - start) / 1000000 + "ms")
+    val sentimentsVector = Vectors.dense(Array(pos.toDouble / total, neg.toDouble / total, neut.toDouble / total))
+    val tokens: Seq[String] = document.tokens().asScala.map(token => token.lemma())
+      .filter(lemma => lemma.length > 2)
+      .filter(lemma => !stopwords.contains(lemma))
+      .map(lemma => lemma.toLowerCase)
+    val r = scala.util.Random
+    if (r.nextInt(100) == 0)
+      println("run sentiment analysis in : " + (System.nanoTime() - start) / 1000000 + "ms")
+    NlpResult(tokens, sentimentsVector)
   }
 
 
