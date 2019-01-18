@@ -5,8 +5,9 @@ import org.apache.kafka.common.serialization.{ByteArrayDeserializer, StringDeser
 import org.apache.log4j.{Level, LogManager}
 import org.apache.spark.SparkContext
 import org.apache.spark.ml.Pipeline
-import org.apache.spark.ml.evaluation.RegressionEvaluator
-import org.apache.spark.ml.feature.{StringIndexer, VectorIndexer}
+import org.apache.spark.ml.classification.{DecisionTreeClassificationModel, DecisionTreeClassifier}
+import org.apache.spark.ml.evaluation.{MulticlassClassificationEvaluator, RegressionEvaluator}
+import org.apache.spark.ml.feature.{IndexToString, StringIndexer, VectorIndexer}
 import org.apache.spark.ml.regression.{DecisionTreeRegressionModel, DecisionTreeRegressor}
 import org.apache.spark.mllib.feature.Word2VecModel
 import org.apache.spark.mllib.linalg.Vector
@@ -45,36 +46,18 @@ object KafkaIntegration {
   )
 
   def main(args: Array[String]): Unit = {
-    val comments: RDD[Comment] = buildCommentsRdd(sparkSession.sparkContext).sample(withReplacement = false, fraction = 0.0001d).repartition(24)
-
-    // calcul de l'ANOVA - rejet de l'hypothèse nulle potentiellement due a un effet "Big Data"
-    //computeAnova(comments)
-
-    // calcul des tfidfs
-    var commentDF = sparkSession.createDataFrame(comments.map(c => Row.fromSeq(Seq(c.getCommentID, c.getCommentBody, c.getCommentType, c.getCreateDate, c.getDepth, c.isEditorsSelection, c.getRecommandations, c.getReplyCount, c.getSharing, c.getUserDisplayName, c.getUseLocation, c.getArticleID, c.getNewDesk, c.getArticleWordCount, c.getPrintPage, c.getTypeOfMaterial))),
-      NewYorkTimesComments.commentSchema).cache()
-    println("df size is " + commentDF.count() + " comments")
-    val preprocessTextUdf = udf((t: String) => {
-      val sentiments = sentimentAnalysis(t)
-      (sentiments.tokens, sentiments.sentiments)
-    })
-    val selectTokens = udf((nlpResult: Row) => nlpResult.getAs[Seq[String]](0))
-    val selectSentiments = udf((nlpResult: Row) => nlpResult.getAs[Vector](1))
-    commentDF = commentDF.withColumn("nlp", preprocessTextUdf($"commentBody")).cache()
-    commentDF = commentDF.withColumn("tokens", selectTokens($"nlp")).withColumn("sentimentVector", selectSentiments($"nlp"))
-
-    val (tfidfDF, bVocabulary) = compteAndCacheTfIdf(commentDF)
-    commentDF = tfidfDF.cache()
-    commentDF.limit(10).foreach(print(_))
-    println("number of partitions commentDF : " + commentDF.rdd.getNumPartitions)
-    println("number of comments : " + commentDF.count())
-
     // entrainement du modele Word2Vec
     //val w2vModel = computeW2V(commentDF)
     val w2vModel = Word2VecModel.load(sparkSession.sparkContext, "comments-w2v")
 
     // vectorisation du texte grace aux representations w2v
-    var vectorised = vectorizeText(commentDF, bVocabulary.value, w2vModel)
+    var vectorised = prepareData(w2vModel)
+    vectorised = sparkSession.read.parquet("prepared-data.small.parquet").repartition(24).cache()
+    println("number of partitions commentDF : " + vectorised.rdd.getNumPartitions)
+    println("number of comments : " + vectorised.count())
+
+    // calcul de l'ANOVA - rejet de l'hypothèse nulle potentiellement due a un effet "Big Data"
+    //computeAnova(vectorised)
 
     // calcul de la decroissance des inerties intra classes
     //computeKMeansInerties(vectorised)
@@ -85,10 +68,40 @@ object KafkaIntegration {
     // run LSA in order to compare with
     //lsa(commentDF, "commentBody", "tokens", preprocess = false)
 
-    // run the decision tree regression
-    vectorised = normalisePredictions(vectorised)
+    //runDecisionTree(vectorised)
+    //runDecisionTreeClassification(vectorised)
+  }
 
-    runDecisionTree(vectorised)
+  def prepareData(word2VecModel: Word2VecModel): DataFrame = {
+    val comments: RDD[Comment] = buildCommentsRdd(sparkSession.sparkContext).sample(withReplacement = false, fraction = 0.01d).repartition(24)
+
+    // calcul des tfidfs
+    var commentDF = sparkSession.createDataFrame(comments.map(c => Row.fromSeq(Seq(c.getCommentID, c.getCommentBody, c.getCommentType, c.getCreateDate, c.getDepth, c.isEditorsSelection, c.getRecommandations, c.getReplyCount, c.getSharing, c.getUserDisplayName, c.getUseLocation, c.getArticleID, c.getNewDesk, c.getArticleWordCount, c.getPrintPage, c.getTypeOfMaterial))),
+      NewYorkTimesComments.commentSchema).cache()
+    val preprocessTextUdf = udf((t: String) => {
+      val sentiments = sentimentAnalysis(t)
+      (sentiments.tokens, sentiments.sentiments)
+    })
+    val selectTokens = udf((nlpResult: Row) => nlpResult.getAs[Seq[String]](0))
+    val selectSentiments = udf((nlpResult: Row) => {
+      val sentiments = nlpResult.getAs[Vector](1)
+      if (sentiments.size != 3) {
+        throw new RuntimeException()
+      }
+      sentiments
+    })
+    commentDF = commentDF.withColumn("nlp", preprocessTextUdf($"commentBody")).cache()
+    commentDF = commentDF.withColumn("tokens", selectTokens($"nlp")).withColumn("sentimentVector", selectSentiments($"nlp"))
+
+    val (tfidfDF, bVocabulary) = compteAndCacheTfIdf(commentDF)
+    commentDF = tfidfDF.cache()
+    commentDF.limit(10).foreach(print(_))
+
+    // vectorisation du texte grace aux representations w2v
+    var vectorised = vectorizeText(commentDF, bVocabulary.value, word2VecModel).cache()
+    vectorised = normalisePredictions(vectorised)
+    vectorised.write.mode("overwrite").parquet("prepared-data.small.parquet")
+    vectorised
   }
 
   def runSentimentAnalysis(df: DataFrame): DataFrame = {
@@ -97,25 +110,106 @@ object KafkaIntegration {
   }
 
   def normalisePredictions(df: DataFrame): DataFrame = {
+    val descretiseReco = udf((r: Int) => {
+      if (r == 0) 0
+      else if (r <= 1) 1
+      else if (r <= 10) 2
+      else if (r <= 100) 3
+      else 4
+    })
+    val descretiseNormReco = udf((r: Double) => {
+      if (r == 0) 0
+      else if (r <= 0.01) 1
+      else if (r <= 0.1) 2
+      else if (r <= 0.5) 3
+      else 4
+    })
     val normReco = udf((n: Int, d: Int) => n.toDouble / d.toDouble)
     val logReco = udf((r: Int) => if(r == 0) -1 else Math.log10(r))
-    val sumDf = df.groupBy($"articleID").sum("recommandations").filter(r => r.getAs[Long]("sum(recommandations)") > 0).cache()
+    val sumDf = df.groupBy($"articleID").agg(sum($"recommandations") as "sum_recommandations").filter(r => r.getAs[Long]("sum_recommandations") > 0).cache()
     val normDf = df.join(sumDf, "articleID")
-      .withColumn("normRecommandations", normReco($"recommandations", $"sum(recommandations)"))
-      .withColumn("logRecommandations", logReco($"recommandations")).cache()
+      .withColumn("normRecommandations", normReco($"recommandations", $"sum_recommandations"))
+      .withColumn("logRecommandations", logReco($"recommandations"))
+      .withColumn("discreteRecommandations", descretiseReco($"recommandations"))
+      .withColumn("discreteNormRecommandations", descretiseNormReco($"normRecommandations")).cache()
+    normDf.groupBy($"discreteRecommandations").count().show()
+    normDf.groupBy($"discreteNormRecommandations").count().show()
     normDf.select("recommandations", "normRecommandations", "logRecommandations").summary().show()
+    printHist("src/main/gnuplot/logrecommandation_hist.txt", normDf.map(r => r.getAs[Double]("logRecommandations")).rdd.histogram(20))
+    printHist("src/main/gnuplot/recommandation_hist.txt", normDf.map(r => r.getAs[Int]("recommandations")).rdd.histogram(20))
+    printHist("src/main/gnuplot/normrecommandation_hist.txt", normDf.map(r => r.getAs[Double]("normRecommandations")).rdd.histogram(20))
     normDf
-    //printHist("src/main/gnuplot/logrecommandation_hist.txt", normDf.map(r => r.getAs[Double]("logRecommandations")).rdd.histogram(20))
   }
 
-  def runDecisionTree(comments: DataFrame): Unit = {
+  def runDecisionTreeClassification(comments: DataFrame): Unit = {
+    //    val toMLVector = udf((v: Vector, wc: Int, printPage: Int, typeOfMaterial: String, newDesk: String) => new org.apache.spark.ml.linalg.DenseVector(v.toArray ++ Array(wc.toDouble, printPage.toDouble, typeOfMaterial.hashCode.toDouble, newDesk.hashCode.toDouble)))
+    val toMLVector = udf((v: Vector, s: Vector, wc: Int, printPage: Int) => new org.apache.spark.ml.linalg.DenseVector(v.toArray ++ s.toArray ++ Array(wc.toDouble, printPage.toDouble)))
+    val data: DataFrame = comments.withColumn("mlvector", toMLVector($"vector", $"sentimentVector", $"articleWordCount", $"printPage")).cache()
+    data.show(10)
+
+    val varToPredict = "discreteNormRecommandations"
+
+    val featureIndexer = new VectorIndexer()
+      .setInputCol("mlvector")
+      .setOutputCol("indexedVector")
+      .setMaxCategories(4)
+      .fit(data)
+    val labelIndexer = new StringIndexer()
+      .setInputCol(varToPredict)
+      .setOutputCol("indexedLabel")
+      .fit(data)
+    val Array(trainingData, testData) = data.randomSplit(Array(0.7, 0.3))
+
+    // Train a DecisionTree model.
+    val dt = new DecisionTreeClassifier()
+      .setMaxBins(64)
+      .setMinInstancesPerNode(2)
+      .setLabelCol(varToPredict)
+      .setFeaturesCol("indexedVector")
+
+    // Convert indexed labels back to original labels.
+    val labelConverter = new IndexToString()
+      .setInputCol("prediction")
+      .setOutputCol("predictedLabel")
+      .setLabels(labelIndexer.labels)
+
+    // Chain indexers and tree in a Pipeline.
+    val pipeline = new Pipeline().setStages(Array(labelIndexer, featureIndexer, dt, labelConverter))
+
+    // Train model. This also runs the indexers.
+    val model = pipeline.fit(trainingData)
+
+    // Make predictions
+    val predictions = model.transform(testData)
+
+    // Select example rows to display.
+    predictions.select("prediction", varToPredict, "mlVector").show(10)
+    predictions.select("prediction", varToPredict).printSchema()
+    val predictionsAndLabels: RDD[(Double, Double)] = predictions.select("prediction", varToPredict).map(r => (r.getDouble(0), r.getInt(1).toDouble)).rdd
+    val metrics = new org.apache.spark.mllib.evaluation.MulticlassMetrics(predictionsAndLabels)
+    println(metrics.confusionMatrix)
+
+    // Select (prediction, true label) and compute test error.
+    val evaluator = new MulticlassClassificationEvaluator()
+      .setLabelCol("indexedLabel")
+      .setPredictionCol("prediction")
+      .setMetricName("accuracy")
+    val accuracy = evaluator.evaluate(predictions)
+    println("Test Error = " + (1.0 - accuracy))
+
+    val treeModel = model.stages(2).asInstanceOf[DecisionTreeClassificationModel]
+    println("Learned classification tree model:\n" + treeModel.toDebugString)
+    println(treeModel.featureImportances)
+  }
+
+  def runDecisionTreeRegression(comments: DataFrame): Unit = {
 //    val toMLVector = udf((v: Vector, wc: Int, printPage: Int, typeOfMaterial: String, newDesk: String) => new org.apache.spark.ml.linalg.DenseVector(v.toArray ++ Array(wc.toDouble, printPage.toDouble, typeOfMaterial.hashCode.toDouble, newDesk.hashCode.toDouble)))
     val toMLVector = udf((v: Vector, s: Vector, wc: Int) => new org.apache.spark.ml.linalg.DenseVector(v.toArray ++ s.toArray ++ Array(wc.toDouble)))
 
     val data: DataFrame = comments.withColumn("mlvector", toMLVector($"vector", $"sentimentVector", $"articleWordCount")).cache()
     data.show(10)
 
-    val varToPredict = "normRecommandations"
+    val varToPredict = "logRecommandations"
 
     val featureIndexer = new VectorIndexer()
       .setInputCol("mlvector")

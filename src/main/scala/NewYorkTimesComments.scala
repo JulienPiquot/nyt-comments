@@ -376,8 +376,8 @@ object NewYorkTimesComments {
   def sentimentAnalysis(text: String): NlpResult = {
     val start = System.nanoTime();
     val properties = new Properties()
-    properties.setProperty("annotators", "tokenize, ssplit, pos, lemma")
-    //properties.setProperty("annotators", "tokenize, ssplit, pos, lemma, parse, sentiment")
+    //properties.setProperty("annotators", "tokenize, ssplit, pos, lemma")
+    properties.setProperty("annotators", "tokenize, ssplit, pos, lemma, parse, sentiment")
     val pipeline: StanfordCoreNLP = new StanfordCoreNLP(properties)
     val document: CoreDocument = new CoreDocument(text)
     pipeline.annotate(document)
