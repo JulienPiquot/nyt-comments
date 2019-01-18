@@ -5,7 +5,7 @@ import org.apache.kafka.common.serialization.{ByteArrayDeserializer, StringDeser
 import org.apache.log4j.{Level, LogManager}
 import org.apache.spark.SparkContext
 import org.apache.spark.ml.Pipeline
-import org.apache.spark.ml.classification.{DecisionTreeClassificationModel, DecisionTreeClassifier}
+import org.apache.spark.ml.classification.{DecisionTreeClassificationModel, DecisionTreeClassifier, GBTClassificationModel, GBTClassifier}
 import org.apache.spark.ml.evaluation.{MulticlassClassificationEvaluator, RegressionEvaluator}
 import org.apache.spark.ml.feature.{IndexToString, StringIndexer, VectorIndexer}
 import org.apache.spark.ml.regression.{DecisionTreeRegressionModel, DecisionTreeRegressor}
@@ -51,10 +51,15 @@ object KafkaIntegration {
     val w2vModel = Word2VecModel.load(sparkSession.sparkContext, "comments-w2v")
 
     // vectorisation du texte grace aux representations w2v
-    var vectorised = prepareData(w2vModel)
-    vectorised = sparkSession.read.parquet("prepared-data.small.parquet").repartition(24).cache()
+    //var vectorised = prepareData(w2vModel)
+    var vectorised = sparkSession.read.parquet("prepared-data.small.parquet").repartition(24).cache()
     println("number of partitions commentDF : " + vectorised.rdd.getNumPartitions)
     println("number of comments : " + vectorised.count())
+    vectorised.show(5, false)
+    vectorised.select("recommandations", "normRecommandations", "logRecommandations").summary().show()
+    vectorised.groupBy($"discreteRecommandations").count().show()
+    vectorised.groupBy($"discreteNormRecommandations").count().show()
+
 
     // calcul de l'ANOVA - rejet de l'hypothèse nulle potentiellement due a un effet "Big Data"
     //computeAnova(vectorised)
@@ -66,10 +71,20 @@ object KafkaIntegration {
     //computeAndVisualizeKMeans(w2vModel, vectorised, 10)
 
     // run LSA in order to compare with
-    //lsa(commentDF, "commentBody", "tokens", preprocess = false)
+    //lsa(vectorised, "commentBody", "tokens", preprocess = false)
 
     //runDecisionTree(vectorised)
+    //checkVariableRelations(vectorised)
     //runDecisionTreeClassification(vectorised)
+  }
+
+  def checkVariableRelations(comments: DataFrame): Unit = {
+    // check relation between editorsSelection and articleWordCount
+    comments.createOrReplaceTempView("comments")
+    sparkSession.sql("SELECT COUNT(articleWordCount), MEAN(articleWordCount), STDDEV(articleWordCount), MIN(articleWordCount), MAX(articleWordCount) FROM comments GROUP BY editorsSelection").show()
+
+    //comments.groupBy($"editorsSelection").agg(count($"articleWordCount"), mean($"articleWordCount"), stddev($"articleWordCount"), min($"articleWordCount"), max($"articleWordCount")).show()
+    //comments.groupBy($"editorsSelection").agg(count($"printPage"), mean($"printPage"), stddev($"printPage"), min($"printPage"), max($"printPage")).show()
   }
 
   def prepareData(word2VecModel: Word2VecModel): DataFrame = {
@@ -144,10 +159,13 @@ object KafkaIntegration {
   def runDecisionTreeClassification(comments: DataFrame): Unit = {
     //    val toMLVector = udf((v: Vector, wc: Int, printPage: Int, typeOfMaterial: String, newDesk: String) => new org.apache.spark.ml.linalg.DenseVector(v.toArray ++ Array(wc.toDouble, printPage.toDouble, typeOfMaterial.hashCode.toDouble, newDesk.hashCode.toDouble)))
     val toMLVector = udf((v: Vector, s: Vector, wc: Int, printPage: Int) => new org.apache.spark.ml.linalg.DenseVector(v.toArray ++ s.toArray ++ Array(wc.toDouble, printPage.toDouble)))
-    val data: DataFrame = comments.withColumn("mlvector", toMLVector($"vector", $"sentimentVector", $"articleWordCount", $"printPage")).cache()
+    var data: DataFrame = comments.withColumn("mlvector", toMLVector($"vector", $"sentimentVector", $"articleWordCount", $"printPage")).cache()
     data.show(10)
 
-    val varToPredict = "discreteNormRecommandations"
+    val varToPredict = "editorsSelectionLabel"
+    val toIntUdf = udf((b: Boolean) => if (b) 1 else 0)
+    data = data.withColumn(varToPredict, toIntUdf($"editorsSelection"))
+    data.groupBy(varToPredict).count().show()
 
     val featureIndexer = new VectorIndexer()
       .setInputCol("mlvector")
@@ -161,11 +179,12 @@ object KafkaIntegration {
     val Array(trainingData, testData) = data.randomSplit(Array(0.7, 0.3))
 
     // Train a DecisionTree model.
-    val dt = new DecisionTreeClassifier()
-      .setMaxBins(64)
-      .setMinInstancesPerNode(2)
+    val dt = new GBTClassifier()
+      //.setMaxBins(64)
+      //.setMinInstancesPerNode(2)
       .setLabelCol(varToPredict)
       .setFeaturesCol("indexedVector")
+      .setMaxIter(10)
 
     // Convert indexed labels back to original labels.
     val labelConverter = new IndexToString()
@@ -197,7 +216,7 @@ object KafkaIntegration {
     val accuracy = evaluator.evaluate(predictions)
     println("Test Error = " + (1.0 - accuracy))
 
-    val treeModel = model.stages(2).asInstanceOf[DecisionTreeClassificationModel]
+    val treeModel = model.stages(2).asInstanceOf[GBTClassificationModel]
     println("Learned classification tree model:\n" + treeModel.toDebugString)
     println(treeModel.featureImportances)
   }
