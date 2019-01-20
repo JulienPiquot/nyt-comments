@@ -53,8 +53,8 @@ object KafkaIntegration {
     val w2vModel = Word2VecModel.load(sparkSession.sparkContext, "comments-w2v")
 
     // vectorisation du texte grace aux representations w2v
-    //var vectorised = prepareData(w2vModel)
-    var vectorised = sparkSession.read.parquet("prepared-data.medium.parquet").repartition(24).cache()
+    var vectorised = prepareData(w2vModel)
+    vectorised = sparkSession.read.parquet("prepared-data.stratified.medium.parquet").repartition(24).cache()
     println("number of partitions commentDF : " + vectorised.rdd.getNumPartitions)
     println("number of comments : " + vectorised.count())
     vectorised.show(5, false)
@@ -87,7 +87,7 @@ object KafkaIntegration {
 
     //runDecisionTree(vectorised)
     //checkVariableRelations(vectorised)
-    runDecisionTreeClassification(vectorised)
+    //runDecisionTreeClassification(vectorised)
   }
 
   def checkVariableRelations(comments: DataFrame): Unit = {
@@ -113,11 +113,23 @@ object KafkaIntegration {
   }
 
   def prepareData(word2VecModel: Word2VecModel): DataFrame = {
-    val comments: RDD[Comment] = buildCommentsRdd(sparkSession.sparkContext).sample(withReplacement = false, fraction = 0.1d).repartition(24)
+    val comments: RDD[Comment] = buildCommentsRdd(sparkSession.sparkContext).sample(withReplacement = false, fraction = 1.0d).repartition(24)
 
     // calcul des tfidfs
     var commentDF = sparkSession.createDataFrame(comments.map(c => Row.fromSeq(Seq(c.getCommentID, c.getCommentBody, c.getCommentType, c.getCreateDate, c.getDepth, c.isEditorsSelection, c.getRecommandations, c.getReplyCount, c.getSharing, c.getUserDisplayName, c.getUseLocation, c.getArticleID, c.getNewDesk, c.getArticleWordCount, c.getPrintPage, c.getTypeOfMaterial))),
       NewYorkTimesComments.commentSchema).cache()
+    commentDF.createOrReplaceTempView("comments")
+
+    var articlesDF = sparkSession.sql("SELECT articleID, MAX(editorsSelection) AS selectionDone FROM comments GROUP BY articleID").cache()
+    val articleWithSelection = articlesDF.filter(row => row.getBoolean(1)).cache()
+    val articleWithoutSelection = articlesDF.filter(row => !row.getBoolean(1)).sample(0.1).cache()
+    println("article with selecion = " + articleWithSelection.count())
+    println("article without selecion = " + articleWithoutSelection.count())
+    articlesDF = articleWithSelection.union(articleWithoutSelection).cache()
+
+    commentDF = commentDF.join(articlesDF, "articleID").cache()
+    println("start preparing data - number of comments : " + commentDF.count())
+
     val preprocessTextUdf = udf((t: String) => {
       val sentiments = sentimentAnalysis(t)
       (sentiments.tokens, sentiments.sentiments)
@@ -140,7 +152,7 @@ object KafkaIntegration {
     // vectorisation du texte grace aux representations w2v
     var vectorised = vectorizeText(commentDF, bVocabulary.value, word2VecModel).cache()
     vectorised = normalisePredictions(vectorised)
-    vectorised.write.mode("overwrite").parquet("prepared-data.medium.parquet")
+    vectorised.write.mode("overwrite").parquet("prepared-data.stratified.medium.parquet")
 
     // editorSelection as Int
     val toIntUdf = udf((b: Boolean) => if (b) 1 else 0)
@@ -190,9 +202,11 @@ object KafkaIntegration {
     //    val toMLVector = udf((v: Vector, wc: Int, printPage: Int, typeOfMaterial: String, newDesk: String) => new org.apache.spark.ml.linalg.DenseVector(v.toArray ++ Array(wc.toDouble, printPage.toDouble, typeOfMaterial.hashCode.toDouble, newDesk.hashCode.toDouble)))
     val toMLVector = udf((v: Vector, s: Vector, wc: Int, printPage: Int) => new org.apache.spark.ml.linalg.DenseVector(v.toArray ++ s.toArray ++ Array(wc.toDouble, printPage.toDouble)))
     var data: DataFrame = comments.withColumn("mlvector", toMLVector($"vector", $"sentimentVector", $"articleWordCount", $"printPage")).cache()
-    data.show(10)
-    //val selection = data.filter(row => row.getAs[Boolean]("editorsSelection"))
-    //val nonSelection = data.filter(row => !row.getAs[Boolean]("editorsSelection"))
+    //data.show(10)
+    data.createOrReplaceTempView("comments")
+    println(sparkSession.sql("SELECT articleID, MAX(editorsSelection) AS selectionDone FROM comments GROUP BY articleID").filter(row => row.getBoolean(1)).count())
+    println(sparkSession.sql("SELECT articleID, MAX(editorsSelection) AS selectionDone FROM comments GROUP BY articleID").filter(row => !row.getBoolean(1)).count())
+
 
     //val Row(coeff1: Matrix) = Correlation.corr(data, "mlvector", "spearman").head
     //println("spearman correlation matrix:\n" + coeff1.colIter.toSeq(1).toArray.sortWith(_>_).mkString(","))
@@ -240,7 +254,7 @@ object KafkaIntegration {
     // Select example rows to display.
     predictions.select("prediction", varToPredict, "mlVector").show(10)
     predictions.select("prediction", varToPredict).printSchema()
-    val predictionsAndLabels: RDD[(Double, Double)] = predictions.select("prediction", varToPredict).map(r => (r.getDouble(0), r.getInt(1).toDouble)).rdd
+    val predictionsAndLabels: RDD[(Double, Double)] = predictions.select("prediction", varToPredict).map(r => (r.getDouble(0), r.getDouble(1))).rdd
     val metrics = new org.apache.spark.mllib.evaluation.MulticlassMetrics(predictionsAndLabels)
     println(metrics.confusionMatrix)
 
