@@ -20,7 +20,7 @@ import org.apache.spark.streaming.{Seconds, StreamingContext}
 import org.apache.spark.streaming.kafka010.{KafkaUtils, OffsetRange}
 import org.apache.spark.streaming.kafka010.LocationStrategies.PreferConsistent
 import org.apache.spark.streaming.kafka010.ConsumerStrategies.Subscribe
-import org.apache.spark.sql.functions._
+import org.apache.spark.sql.functions.{udf, _}
 
 
 object KafkaIntegration {
@@ -62,6 +62,16 @@ object KafkaIntegration {
     vectorised.groupBy($"discreteRecommandations").count().show()
     vectorised.groupBy($"discreteNormRecommandations").count().show()
 
+
+    // verifier l'independence des variables articleId et discreteRecommandations
+    val toVect = udf((editorsSelection: Boolean, discreteRecommandations: Int, discreteNormRecommandations: Int) => new org.apache.spark.ml.linalg.DenseVector(Array(if (editorsSelection) 1.0 else 0.0, discreteRecommandations.toDouble, discreteNormRecommandations.toDouble)))
+    val toInt = udf((str: String) => str.hashCode)
+    val chi = ChiSquareTest.test(vectorised
+      .withColumn("checkInd", toVect($"editorsSelection", $"discreteRecommandations", $"discreteNormRecommandations"))
+      .withColumn("articleIdInt", toInt($"articleID")), "checkInd", "articleIdInt").head
+    println("pValues = " + chi.getAs[Vector](0))
+    println("degreesOfFreedom = " + chi.getSeq[Int](1).mkString("[", ",", "]"))
+    println("statistics = " + chi.getAs[Vector](2))
 
     // calcul de l'ANOVA - rejet de l'hypothèse nulle potentiellement due a un effet "Big Data"
     //computeAnova(vectorised, row => CatTuple(row.getAs[String]("articleID"), row.getAs[Double]("normRecommandations")))
@@ -188,6 +198,8 @@ object KafkaIntegration {
     //println("spearman correlation matrix:\n" + coeff1.colIter.toSeq(1).toArray.sortWith(_>_).mkString(","))
 
 
+    val editorsSelectionLabel = udf((editorsSelection: Boolean) => if (editorsSelection) 1.0 else 0.0)
+    data = data.withColumn("editorsSelectionLabel", editorsSelectionLabel($"editorsSelection"))
     data.groupBy("editorsSelectionLabel").count().show()
 
     val varToPredict = "editorsSelectionLabel"
