@@ -53,8 +53,8 @@ object KafkaIntegration {
     val w2vModel = Word2VecModel.load(sparkSession.sparkContext, "comments-w2v")
 
     // vectorisation du texte grace aux representations w2v
-    var vectorised = prepareData(w2vModel)
-    vectorised = sparkSession.read.parquet("prepared-data.stratified.medium.parquet").repartition(24).cache()
+   // var vectorised = prepareData(w2vModel)
+    var vectorised = sparkSession.read.parquet("prepared-data.stratified.medium.parquet").repartition(24).cache()
     println("number of partitions commentDF : " + vectorised.rdd.getNumPartitions)
     println("number of comments : " + vectorised.count())
     vectorised.show(5, false)
@@ -86,25 +86,32 @@ object KafkaIntegration {
     //lsa(vectorised, "commentBody", "tokens", preprocess = false)
 
     //runDecisionTree(vectorised)
-    //checkVariableRelations(vectorised)
-    //runDecisionTreeClassification(vectorised)
+    checkVariableRelations(vectorised)
+    runDecisionTreeClassification(vectorised)
+    println(System.currentTimeMillis())
   }
 
   def checkVariableRelations(comments: DataFrame): Unit = {
     // check relation between editorsSelection and articleWordCount
     comments.createOrReplaceTempView("comments")
+    comments.groupBy($"editorsSelection").count().show()
+
     println("check articleWordCount vs editorsSelection")
     sparkSession.sql("SELECT COUNT(articleWordCount), MEAN(articleWordCount), STDDEV(articleWordCount), MIN(articleWordCount), PERCENTILE_APPROX(articleWordCount, 0.25), PERCENTILE_APPROX(articleWordCount, 0.50), PERCENTILE_APPROX(articleWordCount, 0.75), MAX(articleWordCount) FROM comments GROUP BY editorsSelection").show()
-    computeAnova(comments, row => CatTuple(row.getAs[Boolean]("editorsSelection").toString, row.getAs[Int]("articleWordCount")))
+//    computeAnova(comments, row => CatTuple(row.getAs[Boolean]("editorsSelection").toString, row.getAs[Int]("articleWordCount")))
 
     println("check printPage vs editorsSelection")
     sparkSession.sql("SELECT COUNT(printPage), MEAN(printPage), STDDEV(printPage), MIN(printPage), PERCENTILE_APPROX(printPage, 0.25), PERCENTILE_APPROX(printPage, 0.50), PERCENTILE_APPROX(printPage, 0.75), MAX(printPage) FROM comments GROUP BY editorsSelection").show()
-    computeAnova(comments, row => CatTuple(row.getAs[Boolean]("editorsSelection").toString, row.getAs[Int]("printPage")))
 
-    println("check sentiments vs editorsSelection")
-    computeAnova(comments, row => CatTuple(row.getAs[Boolean]("editorsSelection").toString, row.getAs[Vector]("sentimentVector").toArray(0)))
-    computeAnova(comments, row => CatTuple(row.getAs[Boolean]("editorsSelection").toString, row.getAs[Vector]("sentimentVector").toArray(1)))
-    computeAnova(comments, row => CatTuple(row.getAs[Boolean]("editorsSelection").toString, row.getAs[Vector]("sentimentVector").toArray(2)))
+    println("check recommandations vs editorsSelection")
+    sparkSession.sql("SELECT COUNT(recommandations), MEAN(recommandations), STDDEV(recommandations), MIN(recommandations), PERCENTILE_APPROX(recommandations, 0.25), PERCENTILE_APPROX(recommandations, 0.50), PERCENTILE_APPROX(recommandations, 0.75), MAX(recommandations) FROM comments GROUP BY editorsSelection").show()
+
+    //computeAnova(comments, row => CatTuple(row.getAs[Boolean]("editorsSelection").toString, row.getAs[Int]("printPage")))
+
+//    println("check sentiments vs editorsSelection")
+//    computeAnova(comments, row => CatTuple(row.getAs[Boolean]("editorsSelection").toString, row.getAs[Vector]("sentimentVector").toArray(0)))
+//    computeAnova(comments, row => CatTuple(row.getAs[Boolean]("editorsSelection").toString, row.getAs[Vector]("sentimentVector").toArray(1)))
+//    computeAnova(comments, row => CatTuple(row.getAs[Boolean]("editorsSelection").toString, row.getAs[Vector]("sentimentVector").toArray(2)))
 
 
 
@@ -113,7 +120,7 @@ object KafkaIntegration {
   }
 
   def prepareData(word2VecModel: Word2VecModel): DataFrame = {
-    val comments: RDD[Comment] = buildCommentsRdd(sparkSession.sparkContext).sample(withReplacement = false, fraction = 1.0d).repartition(24)
+    val comments: RDD[Comment] = buildCommentsRdd(sparkSession.sparkContext).sample(false, 1.0).repartition(24)
 
     // calcul des tfidfs
     var commentDF = sparkSession.createDataFrame(comments.map(c => Row.fromSeq(Seq(c.getCommentID, c.getCommentBody, c.getCommentType, c.getCreateDate, c.getDepth, c.isEditorsSelection, c.getRecommandations, c.getReplyCount, c.getSharing, c.getUserDisplayName, c.getUseLocation, c.getArticleID, c.getNewDesk, c.getArticleWordCount, c.getPrintPage, c.getTypeOfMaterial))),
@@ -121,13 +128,13 @@ object KafkaIntegration {
     commentDF.createOrReplaceTempView("comments")
 
     var articlesDF = sparkSession.sql("SELECT articleID, MAX(editorsSelection) AS selectionDone FROM comments GROUP BY articleID").cache()
-    val articleWithSelection = articlesDF.filter(row => row.getBoolean(1)).cache()
-    val articleWithoutSelection = articlesDF.filter(row => !row.getBoolean(1)).sample(0.1).cache()
+    val articleWithSelection = articlesDF.filter(row => row.getBoolean(1)).sample(0.1).cache()
+    val articleWithoutSelection = articlesDF.filter(row => !row.getBoolean(1)).sample(0.0).cache()
     println("article with selecion = " + articleWithSelection.count())
     println("article without selecion = " + articleWithoutSelection.count())
     articlesDF = articleWithSelection.union(articleWithoutSelection).cache()
 
-    commentDF = commentDF.join(articlesDF, "articleID").cache()
+    commentDF = commentDF.join(articleWithSelection, "articleID").repartition(24).cache()
     println("start preparing data - number of comments : " + commentDF.count())
 
     val preprocessTextUdf = udf((t: String) => {
@@ -198,29 +205,27 @@ object KafkaIntegration {
     normDf
   }
 
+  def rebalance(comments: DataFrame): DataFrame = {
+    val selectedComments = comments.filter(row => row.getAs[Boolean]("editorsSelection"))
+    val unselectedComments = comments.filter(row => !row.getAs[Boolean]("editorsSelection")).sample(0.2)
+    selectedComments.union(unselectedComments)
+  }
+
   def runDecisionTreeClassification(comments: DataFrame): Unit = {
-    //    val toMLVector = udf((v: Vector, wc: Int, printPage: Int, typeOfMaterial: String, newDesk: String) => new org.apache.spark.ml.linalg.DenseVector(v.toArray ++ Array(wc.toDouble, printPage.toDouble, typeOfMaterial.hashCode.toDouble, newDesk.hashCode.toDouble)))
-    val toMLVector = udf((v: Vector, s: Vector, wc: Int, printPage: Int) => new org.apache.spark.ml.linalg.DenseVector(v.toArray ++ s.toArray ++ Array(wc.toDouble, printPage.toDouble)))
-    var data: DataFrame = comments.withColumn("mlvector", toMLVector($"vector", $"sentimentVector", $"articleWordCount", $"printPage")).cache()
-    //data.show(10)
-    data.createOrReplaceTempView("comments")
-    println(sparkSession.sql("SELECT articleID, MAX(editorsSelection) AS selectionDone FROM comments GROUP BY articleID").filter(row => row.getBoolean(1)).count())
-    println(sparkSession.sql("SELECT articleID, MAX(editorsSelection) AS selectionDone FROM comments GROUP BY articleID").filter(row => !row.getBoolean(1)).count())
-
-
-    //val Row(coeff1: Matrix) = Correlation.corr(data, "mlvector", "spearman").head
-    //println("spearman correlation matrix:\n" + coeff1.colIter.toSeq(1).toArray.sortWith(_>_).mkString(","))
-
+    var data = rebalance(comments)
 
     val editorsSelectionLabel = udf((editorsSelection: Boolean) => if (editorsSelection) 1.0 else 0.0)
     data = data.withColumn("editorsSelectionLabel", editorsSelectionLabel($"editorsSelection"))
-    data.groupBy("editorsSelectionLabel").count().show()
+
+    val toMLVector = udf((v: Vector, s: Vector, wc: Int, printPage: Int, recommandationsQal: Int, normRecommandationsQal: Int) => new org.apache.spark.ml.linalg.DenseVector(v.toArray ++ s.toArray ++ Array(wc.toDouble, printPage.toDouble, recommandationsQal.toDouble, normRecommandationsQal.toDouble)))
+    data = data.withColumn("mlvector", toMLVector($"vector", $"sentimentVector", $"articleWordCount", $"printPage", $"discreteRecommandations", $"discreteNormRecommandations")).cache()
 
     val varToPredict = "editorsSelectionLabel"
+    data.groupBy(varToPredict).count().show()
     val featureIndexer = new VectorIndexer()
       .setInputCol("mlvector")
       .setOutputCol("indexedVector")
-      .setMaxCategories(4)
+      .setMaxCategories(10)
       .fit(data)
     val labelIndexer = new StringIndexer()
       .setInputCol(varToPredict)
@@ -229,12 +234,11 @@ object KafkaIntegration {
     val Array(trainingData, testData) = data.randomSplit(Array(0.7, 0.3))
 
     // Train a DecisionTree model.
-    val dt = new GBTClassifier()
+    val dt = new DecisionTreeClassifier()
       //.setMaxBins(64)
       //.setMinInstancesPerNode(2)
       .setLabelCol(varToPredict)
       .setFeaturesCol("indexedVector")
-      .setMaxIter(10)
 
     // Convert indexed labels back to original labels.
     val labelConverter = new IndexToString()
@@ -257,6 +261,9 @@ object KafkaIntegration {
     val predictionsAndLabels: RDD[(Double, Double)] = predictions.select("prediction", varToPredict).map(r => (r.getDouble(0), r.getDouble(1))).rdd
     val metrics = new org.apache.spark.mllib.evaluation.MulticlassMetrics(predictionsAndLabels)
     println(metrics.confusionMatrix)
+    println("Recall" + metrics.recall(1.0))
+    println("Precision" + metrics.precision(1.0))
+    println("F-mesure" + metrics.fMeasure(1.0))
 
     // Select (prediction, true label) and compute test error.
     val evaluator = new MulticlassClassificationEvaluator()
@@ -266,7 +273,7 @@ object KafkaIntegration {
     val accuracy = evaluator.evaluate(predictions)
     println("Test Error = " + (1.0 - accuracy))
 
-    val treeModel = model.stages(2).asInstanceOf[GBTClassificationModel]
+    val treeModel = model.stages(2).asInstanceOf[DecisionTreeClassificationModel]
     println("Learned classification tree model:\n" + treeModel.toDebugString)
     println(treeModel.featureImportances)
   }
