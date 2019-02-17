@@ -53,22 +53,17 @@ object KafkaIntegration {
     val w2vModel = Word2VecModel.load(sparkSession.sparkContext, "comments-w2v")
 
     // vectorisation du texte grace aux representations w2v
-   // var vectorised = prepareData(w2vModel)
+    //var vectorised = prepareData(w2vModel)
     var vectorised = sparkSession.read.parquet("prepared-data.stratified.medium.parquet").repartition(24).cache()
-    println("number of partitions commentDF : " + vectorised.rdd.getNumPartitions)
-    println("number of comments : " + vectorised.count())
-    vectorised.show(5, false)
-    vectorised.select("recommandations", "normRecommandations", "logRecommandations").summary().show()
-    vectorised.groupBy($"discreteRecommandations").count().show()
-    vectorised.groupBy($"discreteNormRecommandations").count().show()
+    basicStats(vectorised)
 
 
-    // verifier l'independence des variables articleId et discreteRecommandations
+    // verifier l'independence des variables editorsSelection et discreteRecommandations
     val toVect = udf((editorsSelection: Boolean, discreteRecommandations: Int, discreteNormRecommandations: Int) => new org.apache.spark.ml.linalg.DenseVector(Array(if (editorsSelection) 1.0 else 0.0, discreteRecommandations.toDouble, discreteNormRecommandations.toDouble)))
     val toInt = udf((str: String) => str.hashCode)
     val chi = ChiSquareTest.test(vectorised
       .withColumn("checkInd", toVect($"editorsSelection", $"discreteRecommandations", $"discreteNormRecommandations"))
-      .withColumn("articleIdInt", toInt($"articleID")), "checkInd", "articleIdInt").head
+      .withColumn("editorsSelectionInt", toInt($"editorsSelection")), "checkInd", "editorsSelectionInt").head
     println("pValues = " + chi.getAs[Vector](0))
     println("degreesOfFreedom = " + chi.getSeq[Int](1).mkString("[", ",", "]"))
     println("statistics = " + chi.getAs[Vector](2))
@@ -91,6 +86,23 @@ object KafkaIntegration {
     println(System.currentTimeMillis())
   }
 
+  def basicStats(commentDF: DataFrame) = {
+    commentDF.createOrReplaceTempView("comments")
+    println("number of partitions commentDF : " + commentDF.rdd.getNumPartitions)
+    println("number of comments : " + commentDF.count())
+    //commentDF.show(5, false)
+    sparkSession.sql("SELECT editorsSelection, COUNT(*) AS effectif FROM comments GROUP BY editorsSelection").show()
+    commentDF.select("recommandations").summary().show()
+    commentDF.select("recommandations", "normRecommandations", "logRecommandations").summary().show()
+    //commentDF.groupBy($"discreteRecommandations").count().show()
+    //commentDF.groupBy($"discreteNormRecommandations").count().show()
+//    sparkSession.sql("SELECT COUNT(commentID) AS comment_count " +
+//      "FROM comments " +
+//      "GROUP BY articleID").summary().show()
+    val countCount = udf((tokens: Seq[String]) => tokens.size)
+    commentDF.withColumn("tokens_count", countCount($"tokens")).select($"tokens_count").summary().show()
+  }
+
   def checkVariableRelations(comments: DataFrame): Unit = {
     // check relation between editorsSelection and articleWordCount
     comments.createOrReplaceTempView("comments")
@@ -104,7 +116,7 @@ object KafkaIntegration {
     sparkSession.sql("SELECT COUNT(printPage), MEAN(printPage), STDDEV(printPage), MIN(printPage), PERCENTILE_APPROX(printPage, 0.25), PERCENTILE_APPROX(printPage, 0.50), PERCENTILE_APPROX(printPage, 0.75), MAX(printPage) FROM comments GROUP BY editorsSelection").show()
 
     println("check recommandations vs editorsSelection")
-    sparkSession.sql("SELECT COUNT(recommandations), MEAN(recommandations), STDDEV(recommandations), MIN(recommandations), PERCENTILE_APPROX(recommandations, 0.25), PERCENTILE_APPROX(recommandations, 0.50), PERCENTILE_APPROX(recommandations, 0.75), MAX(recommandations) FROM comments GROUP BY editorsSelection").show()
+    sparkSession.sql("SELECT editorsSelection, MEAN(recommandations) AS mean, STDDEV(recommandations) AS stddev, PERCENTILE_APPROX(recommandations, 0.50) AS med FROM comments GROUP BY editorsSelection").show()
 
     //computeAnova(comments, row => CatTuple(row.getAs[Boolean]("editorsSelection").toString, row.getAs[Int]("printPage")))
 
@@ -120,7 +132,12 @@ object KafkaIntegration {
   }
 
   def prepareData(word2VecModel: Word2VecModel): DataFrame = {
-    val comments: RDD[Comment] = buildCommentsRdd(sparkSession.sparkContext).sample(false, 1.0).repartition(24)
+    val start = System.nanoTime()
+    println("start !")
+    var comments: RDD[Comment] = buildCommentsRdd(sparkSession.sparkContext)
+    System.out.println(comments.count() + " comments")
+    println((System.nanoTime() - start) / 1000000000.0 + " s")
+    comments = comments.repartition(24)
 
     // calcul des tfidfs
     var commentDF = sparkSession.createDataFrame(comments.map(c => Row.fromSeq(Seq(c.getCommentID, c.getCommentBody, c.getCommentType, c.getCreateDate, c.getDepth, c.isEditorsSelection, c.getRecommandations, c.getReplyCount, c.getSharing, c.getUserDisplayName, c.getUseLocation, c.getArticleID, c.getNewDesk, c.getArticleWordCount, c.getPrintPage, c.getTypeOfMaterial))),
@@ -357,10 +374,10 @@ object KafkaIntegration {
     val offsetRanges = Array(
       // topic, partition, inclusive starting offset, exclusive ending offset
       // max num is 544085
-      OffsetRange("comments", 0, 0, 544085),
-      OffsetRange("comments", 1, 0, 544085),
-      OffsetRange("comments", 2, 0, 544085),
-      OffsetRange("comments", 3, 0, 544085)
+      OffsetRange("comments", 0, 0, 10000),
+      OffsetRange("comments", 1, 0, 10000),
+      OffsetRange("comments", 2, 0, 10000),
+      OffsetRange("comments", 3, 0, 10000)
     )
 
     KafkaUtils.createRDD[String, Array[Byte]](sparkContext, kafkaParams.asJava, offsetRanges, PreferConsistent)
